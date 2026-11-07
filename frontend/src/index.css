@@ -11,6 +11,10 @@
    result of the scroll, not content loading in. */
 html {
   overflow-anchor: none;
+  /* The panel paints its own background on the #root div, not on <html>, so pulling past the top or
+     bottom (iOS rubber-band, desktop overscroll) showed a white strip under a dark page. Colour it
+     with the theme token instead: white in light, black in dark. */
+  background-color: hsl(var(--heroui-background));
 }
 
 /* The white box around a focused field is Chrome's own focus ring, not HeroUI's.

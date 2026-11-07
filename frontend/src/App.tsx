@@ -23,6 +23,7 @@ import DeleteAccountModal from './DeleteAccountModal'
 import ProfileCleanupModal from './ProfileCleanupModal'
 import AccountAvatar from './AccountAvatar'
 import PromoCard from './PromoCard'
+import ThemeToggle from './ThemeToggle'
 import { defaultSkins, type AvatarColor, type AvatarShape } from './avatar'
 import { loginMethodMeta, SearchIcon } from './icons'
 import { useStuck } from './useStuck'
@@ -44,7 +45,11 @@ function toastStack(): HTMLElement {
 function toast(text: string, ok: boolean) {
   const el = document.createElement('div')
   el.textContent = text
-  el.className = `max-w-full sm:max-w-sm px-4 py-2 rounded-lg text-white shadow-lg text-sm ${ok ? 'bg-success' : 'bg-danger'}`
+  // `-foreground` 而不是写死 text-white：HeroUI 的 success/danger 底在亮暗两个主题下
+  // 都不是深色（亮色 #12c06a 附近），白字对比度只有 2 出头；token 给的才是配套前景色。
+  el.className = `max-w-full sm:max-w-sm px-4 py-2 rounded-lg shadow-lg text-sm ${
+    ok ? 'bg-success text-success-foreground' : 'bg-danger text-danger-foreground'
+  }`
   toastStack().appendChild(el)
   setTimeout(() => el.remove(), ok ? 4000 : 9000)
 }
@@ -452,6 +457,7 @@ export default function App() {
             </div>
           </div>
           <div className="flex items-center gap-2">
+            <ThemeToggle />
             <Input
               isClearable
               value={search}

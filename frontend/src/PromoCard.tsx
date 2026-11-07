@@ -125,11 +125,11 @@ export default function PromoCard() {
           shown ? 'translate-y-0 opacity-100' : 'translate-y-3 opacity-0'
         }`}
       >
-        <div className="relative rounded-[26px] border border-black/5 bg-white p-3.5 shadow-[0_20px_60px_-16px_rgba(16,18,32,0.45)]">
+        <div className="relative rounded-[26px] border border-black/5 bg-white p-3.5 shadow-[0_20px_60px_-16px_rgba(16,18,32,0.45)] dark:border-white/10 dark:bg-[#15161d] dark:shadow-[0_20px_60px_-16px_rgba(0,0,0,0.8)]">
           {/* The sticker overhangs the corner, so it hangs off this box rather than living inside
               the hero's overflow-hidden. -right-2 still leaves a margin at the viewport edge. */}
           <span
-            className={`absolute -right-2 -top-3 z-10 overflow-hidden rounded-[13px] border-[3px] border-white px-2.5 py-1 text-[13px] font-semibold leading-tight rotate-[9deg] shadow-[0_6px_16px_-4px_rgba(16,18,32,0.5)] ${sticker.skin}`}
+            className={`absolute -right-2 -top-3 z-10 overflow-hidden rounded-[13px] border-[3px] border-white px-2.5 py-1 text-[13px] font-semibold leading-tight rotate-[9deg] shadow-[0_6px_16px_-4px_rgba(16,18,32,0.5)] dark:border-[#15161d] ${sticker.skin}`}
           >
             {sticker.label}
             {/* 反光 — a band of light crossing the sticker. Decorative, and off under
@@ -168,15 +168,15 @@ export default function PromoCard() {
           </div>
 
           <div className="px-1.5 pb-0.5 pt-4">
-            <h2 className="text-[19px] font-semibold text-[#0b0c12]">{card.title}</h2>
-            {card.body && <p className="mt-2 text-[13px] leading-relaxed text-black/50">{card.body}</p>}
+            <h2 className="text-[19px] font-semibold text-[#0b0c12] dark:text-[#f2f4f8]">{card.title}</h2>
+            {card.body && <p className="mt-2 text-[13px] leading-relaxed text-black/50 dark:text-white/55">{card.body}</p>}
             {/* Hand-rolled, so it needs its own focus ring: index.css kills the UA one.
                 The href is remote input; panel/promo.py has already refused anything but https. */}
             <a
               href={card.cta.url}
               target="_blank"
               rel="noreferrer"
-              className="mt-4 flex h-11 items-center justify-center rounded-xl bg-[#0b0c12] font-mono text-[13px] tracking-wide text-white transition hover:bg-[#0b0c12]/85 focus-visible:ring-2 focus-visible:ring-[#0b0c12]/60"
+              className="mt-4 flex h-11 items-center justify-center rounded-xl bg-[#0b0c12] font-mono text-[13px] tracking-wide text-white transition hover:bg-[#0b0c12]/85 focus-visible:ring-2 focus-visible:ring-[#0b0c12]/60 dark:bg-white/10 dark:text-[#f2f4f8] dark:hover:bg-white/15 dark:focus-visible:ring-white/50"
             >
               {card.cta.label}
             </a>

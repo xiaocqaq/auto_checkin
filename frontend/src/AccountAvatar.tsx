@@ -38,7 +38,7 @@ function Face({ name, color, shape }: { name: string; color: AvatarColor; shape:
             <span className={`absolute inset-0 rounded-full ${AVATAR_ORB_GLOSS}`} />
           </span>
         }
-        classNames={{ base: 'bg-transparent ring-1 ring-inset ring-black/5' }}
+        classNames={{ base: 'bg-transparent ring-1 ring-inset ring-black/5 dark:ring-white/10' }}
       />
     )
   }

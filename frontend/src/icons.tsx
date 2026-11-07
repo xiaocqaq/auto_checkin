@@ -56,6 +56,29 @@ export const SearchIcon: FC<IconProps> = (props) => (
   </svg>
 )
 
+/** 亮暗切换用的一对。画的是「按下去会变成什么」，所以两者的语义不能互换。
+ *  与面板其余图标同一套线条（stroke 1.8，圆头）。 */
+export const SunIcon: FC<IconProps> = (props) => (
+  <svg {...base(props)} fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round">
+    <circle cx="12" cy="12" r="4.2" />
+    <path d="M12 2.4v2.2M12 19.4v2.2M2.4 12h2.2M19.4 12h2.2M5.2 5.2l1.6 1.6M17.2 17.2l1.6 1.6M18.8 5.2l-1.6 1.6M6.8 17.2l-1.6 1.6" />
+  </svg>
+)
+
+export const MoonIcon: FC<IconProps> = (props) => (
+  <svg {...base(props)} fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round">
+    <path d="M20.5 15.1A8.6 8.6 0 0 1 8.9 3.5a8.8 8.8 0 1 0 11.6 11.6Z" />
+  </svg>
+)
+
+/** 跟随系统：一块显示器。用「设备」而不是「齿轮」—— 它表示的是听设备的，不是进设置。 */
+export const MonitorIcon: FC<IconProps> = (props) => (
+  <svg {...base(props)} fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round">
+    <rect x="2.5" y="4" width="19" height="13" rx="2.5" />
+    <path d="M9 20.5h6M12 17v3.5" />
+  </svg>
+)
+
 /** All five methods must be here — `Record` type-errors on a missing key, which is the point. */
 const LOGIN_METHOD_META: Record<LoginMethod, { label: string; Icon: FC<IconProps> }> = {
   password: { label: '密码', Icon: KeyIcon },
