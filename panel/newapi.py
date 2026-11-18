@@ -140,6 +140,7 @@ class PastedCredential:
 
 	value: str
 	cookie_name: str
+	is_bare: bool = False  # only unnamed values may be reinterpreted after probing
 
 
 def credentials_from_paste(raw: Optional[str]) -> list[PastedCredential]:
@@ -169,10 +170,14 @@ def credentials_from_paste(raw: Optional[str]) -> list[PastedCredential]:
 			f'这段 JSON 里没有 {" 也没有 ".join(CREDENTIAL_COOKIES)}，只找到：{listed}。'
 			'请在站点的已登录页面导出 cookie，再整段粘进来'
 		)
-	value = parse_session(text)
-	if not value:
-		raise ValueError('这段内容里找不到可用的凭据')
-	return [PastedCredential(value, 'session')]
+	if re.search(r'(?:^|;\s*)(?:session|new_api_refresh)\s*=', text):
+		jar = SimpleCookie()
+		jar.load(text)
+		found = _credentials_in([{'name': name, 'value': morsel.value} for name, morsel in jar.items()])
+		if not found:
+			raise ValueError('这段内容里找不到可用的凭据')
+		return [PastedCredential(value, name) for name, value in found]
+	return [PastedCredential(text, 'session', is_bare=True)]
 
 
 @dataclass
@@ -199,6 +204,7 @@ class SiteInfo:
 	# route but turned it off (relay11), None on forks that never report it, and
 	# unreadable behind a WAF — so it is recorded, not used to decide anything.
 	checkin_enabled: Optional[bool] = None
+	backend: str = 'newapi'
 
 	@property
 	def mechanism(self) -> str:
@@ -530,6 +536,7 @@ async def probe(base_url: str) -> SiteInfo:
 	from panel import vyce
 
 	if await vyce.looks_like_vyce(info.base_url):
+		info.backend = 'vyce'
 		info.checkin_path = vyce.CLAIM_PATH
 		info.status_path = vyce.DAILY_REWARD_PATH
 		info.login_methods = ('password',)
@@ -539,6 +546,7 @@ async def probe(base_url: str) -> SiteInfo:
 	from panel import sub2api
 
 	if await sub2api.looks_like_sub2api(info.base_url):
+		info.backend = 'sub2api'
 		info.checkin_path = f'{sub2api.API}/check-in'
 		info.status_path = f'{sub2api.API}/check-in/status'
 		info.login_methods = ('password',)
@@ -632,10 +640,14 @@ async def check_in(login: Login, site: Optional[SiteInfo] = None) -> Outcome:
 	"""Do the daily check-in over HTTP. Never launches a browser."""
 	if site is None:
 		site = await probe(login.base_url)
+	refresh_attempted = False
 	if site.refresh_path and login.session and not login.access_token:
+		refresh_attempted = True
 		# A JWT fork stores no session: what sits in the session field is a refresh
 		# cookie, and it has to be spent for a Bearer token before anything works.
 		token, rotated, user = await refresh_access(login.base_url, login.session)
+		if rotated:
+			login = replace(login, session=rotated)
 		if token:
 			login = replace(
 				login,
@@ -647,9 +659,10 @@ async def check_in(login: Login, site: Optional[SiteInfo] = None) -> Outcome:
 			return Outcome(
 				False,
 				error='refresh 凭据已失效：到站点重新登录，复制新的 new_api_refresh cookie 再粘进来',
+				session=rotated,
 			)
 	if site.checkin_path:
-		return await _check_in_endpoint(login, site)
+		return await _check_in_endpoint(login, site, refresh_attempted=refresh_attempted)
 	return await _check_in_login_bonus(login, site)
 
 
@@ -697,9 +710,10 @@ async def _retry_with_captcha(client, site: SiteInfo, login: Login, body: dict) 
 		captcha_id, image = await _fetch_captcha(client, site)
 		if not (captcha_id and image):
 			return body  # no image to read — report what we already have
-		answer = await captcha.solve_image(image)
+		result = await captcha.solve_image_result(image)
+		answer = result.answer
 		if not answer:
-			return body
+			return {**body, 'message': f'验证码识别失败：{result.error}'}
 		try:
 			response = await client.post(
 				site.checkin_path, json={'captcha_id': captcha_id, 'captcha_answer': answer}
@@ -710,11 +724,11 @@ async def _retry_with_captcha(client, site: SiteInfo, login: Login, body: dict) 
 		message = str(body.get('message') or '')
 		if body.get('success') or not captcha.CAPTCHA_WRONG.search(message):
 			return body  # solved, or a different outcome the caller should see
-		print(f'[CAPTCHA] 第 {attempt}/{CAPTCHA_ATTEMPTS} 次识别未通过（{answer}），重取一张')
+		print(f'[CAPTCHA] 第 {attempt}/{CAPTCHA_ATTEMPTS} 次识别未通过，重取一张')
 	return body
 
 
-async def _check_in_endpoint(login: Login, site: SiteInfo) -> Outcome:
+async def _check_in_endpoint(login: Login, site: SiteInfo, *, refresh_attempted: bool = False) -> Outcome:
 	async with _client(
 		site.base_url,
 		session=login.session,
@@ -734,6 +748,20 @@ async def _check_in_endpoint(login: Login, site: SiteInfo) -> Outcome:
 			# 无 token 状态、恒定 401，于是明明签到了也报「今天没有签到记录」——relay17.example 实测。
 			won_token = client.headers.get('Authorization') or won_token
 		before, error = await _self(client)
+		if before is None and site.refresh_path and login.session and not refresh_attempted:
+			# A saved short-lived Bearer may expire between runs. Spend the refresh
+			# cookie once, and keep any rotation even if no usable token was returned.
+			token, rotated, user = await refresh_access(login.base_url, login.session)
+			login = replace(login, session=rotated or login.session)
+			if rotated:
+				client.cookies.clear()  # the client still holds the pre-refresh credential
+			if token:
+				won_token = token
+				client.headers['Authorization'] = token
+				adopted = adopted or user.get('id')
+				if adopted:
+					client.headers['new-api-user'] = str(adopted)
+				before, error = await _self(client)
 		if before is None and login.username and login.password:
 			# The stored credential did not authenticate — a dead session, or a fork that
 			# demands `new-api-user` and we have no id yet ("New-Api-User header not
@@ -796,20 +824,26 @@ async def _check_in_login_bonus(login: Login, site: SiteInfo) -> Outcome:
 			False,
 			error='该站点靠"重新登录"发放额度，而当前凭据无法重新登录。'
 			'请填账号密码，或把登录方式改成 LinuxDO / GitHub（面板会自动用浏览器登录一次）。',
+			session=login.session,
+			access_token=login.access_token,
 		)
 	async with _client(site.base_url, session=login.session, api_user=login.api_user) as client:
 		before, _ = await _self(client)  # old session may be dead; that is fine
 		client.cookies.clear()  # a fresh login replaces the old session, it does not stack
 		data, error = await _password_login(client, login)
 		if error:
-			return Outcome(False, before_quota=usd(before, site.quota_per_unit), error=f'登录失败: {error}')
+			return Outcome(
+				False, before_quota=usd(before, site.quota_per_unit), error=f'登录失败: {error}',
+				session=_cookie_of(client) or login.session, access_token=login.access_token,
+			)
 		after, _ = await _self(client)
 		return Outcome(
 			success=True,
 			checked_in=bool(data.get('checked_in')),
 			before_quota=usd(before, site.quota_per_unit),
 			after_quota=usd(after or data, site.quota_per_unit),
-			session=_cookie_of(client),
+			session=_cookie_of(client) or login.session,
+			access_token=client.headers.get('Authorization'),
 			api_user=data.get('id'),
 			username=data.get('username'),
 		)

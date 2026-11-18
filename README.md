@@ -138,7 +138,8 @@ docker compose -f docker-compose.yml \
 4. `panel/newapi.py` —— 图形验证码重试接线（`_fetch_captcha` / `_retry_with_captcha`）
 5. `panel/service.py` / `panel/newapi.py` —— 两类新后端的**廉价分流探测**
    （`/user/daily-reward` 与 `/api/v1/check-in/status` 未登录回 401 JSON），
-   命中才整条走对应模块，对 New API 系零副作用
+   命中才整条走对应模块。vyce / Sub2API 使用各自的状态与领取协议，明确跳过 New API 的
+   status/额度日志二次核对；不会把它们的凭据发送给不兼容的 New API 路径。
 
 ### 工程加固（都实测踩过）
 6. **子路径部署** —— `frontend/vite.config.ts` 的 `base` 由 `CHECKIN_BASE` 注入
@@ -164,7 +165,11 @@ docker compose -f docker-compose.yml \
 ## 安全
 
 - 面板**没有登录功能**，账号凭据明文存储（上游 ADR-0003 的设计取舍：单用户、跑自己机器上）。
-  默认配置只监听 `127.0.0.1`，所以本机用没问题。
+  默认绑定 `127.0.0.1`；账号 API 不返回密码、session、access token，只返回是否已设置。
+  修改账号时凭据留空保留旧值；API 显式传 `null` 或空字符串可清除。
+  POSIX 数据库及备份权限为 `0600`，新建数据目录为 `0700`，Windows 仍需配置操作系统 ACL。
+- 远程浏览器访问须设置 `PANEL_ALLOWED_ORIGINS`，如 `https://panel.example.com`（不带路径）。
+  Host 与写请求来源校验不替代登录鉴权；详见 [部署说明](docs/deploying.md)。
 - 想从手机 / 别的设备访问 → 用 Tailscale、WireGuard 之类的**私有网络**，别把端口公开。
 - 必须放公网 → **认证 + TLS + 面板端口不对外，三者缺一不可**。做法见 `docs/deploying.md`。
 - `.env` 已 gitignore。别把网关 key / 账号密码提交进仓库。

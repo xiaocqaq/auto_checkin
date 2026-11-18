@@ -16,7 +16,7 @@
 """
 from __future__ import annotations
 
-import base64
+from dataclasses import dataclass
 import os
 import re
 from typing import Optional
@@ -58,8 +58,19 @@ def _clean(text: str) -> str:
 	return ''
 
 
+@dataclass(frozen=True)
+class SolveResult:
+	answer: Optional[str] = None
+	error: Optional[str] = None
+
+
 async def solve_image(image: str) -> Optional[str]:
-	"""让视觉模型读一张验证码。返回识别到的字符；不可用或失败时返回 None。
+	"""Compatibility wrapper for callers that only need an answer."""
+	return (await solve_image_result(image)).answer
+
+
+async def solve_image_result(image: str) -> SolveResult:
+	"""让视觉模型读一张验证码，返回答案或不包含敏感原文的失败摘要。
 
 	`image` 可以是 `data:image/png;base64,...` 也可以是一段裸 base64。
 	"""
@@ -67,7 +78,7 @@ async def solve_image(image: str) -> Optional[str]:
 	key = os.getenv('CHECKIN_VISION_API_KEY', '').strip()
 	model = os.getenv('CHECKIN_VISION_MODEL', DEFAULT_MODEL).strip() or DEFAULT_MODEL
 	if not (base and key):
-		return None
+		return SolveResult(error='识别模型未配置或图片为空')
 
 	raw = (image or '').strip()
 	if raw.startswith('data:'):
@@ -75,7 +86,7 @@ async def solve_image(image: str) -> Optional[str]:
 	elif raw:
 		url = f'data:image/png;base64,{raw}'
 	else:
-		return None
+		return SolveResult(error='识别模型未配置或图片为空')
 
 	payload = {
 		'model': model,
@@ -99,15 +110,16 @@ async def solve_image(image: str) -> Optional[str]:
 	try:
 		async with httpx.AsyncClient(timeout=VISION_TIMEOUT_S, proxy=proxy, trust_env=False) as client:
 			resp = await client.post(f'{base}/chat/completions', json=payload, headers=headers)
+		if not resp.is_success:
+			return SolveResult(error=f'视觉服务 HTTP {resp.status_code}')
 		body = resp.json()
 		content = ((body.get('choices') or [{}])[0].get('message') or {}).get('content', '')
-		return _clean(content) or None
-	except Exception as exc:
-		# 识别失败不是致命错误：调用方会当作「这一轮没答对」继续重试/收尾。
-		# 但静默失败会让人分不清「模型没认出」和「压根没连上」，所以留一条可查的线。
-		if os.getenv('CHECKIN_DEBUG', '').strip() in ('1', 'true', 'yes'):
-			import traceback
-
-			print(f'[CAPTCHA] 识别失败: {type(exc).__name__}: {exc}')
-			traceback.print_exc()
-		return None
+		answer = _clean(content)
+		return SolveResult(answer=answer) if answer else SolveResult(error='视觉服务未返回可用内容')
+	except httpx.TimeoutException:
+		return SolveResult(error='视觉服务请求超时')
+	except httpx.RequestError:
+		return SolveResult(error='视觉服务连接失败')
+	except Exception:
+		# Never include provider responses, URLs, credentials or exception text.
+		return SolveResult(error='视觉服务响应无法解析或请求失败')

@@ -1,9 +1,10 @@
 # Deploying the panel
 
-Three ways to run it, and one thing they all share: **the panel has no login.** Anyone who can
-reach its port can read every account's password and session in plaintext, because `GET
-/api/accounts` returns them that way by design (ADR-0003 — a single-user panel on the owner's
-own machine). Everything below follows from that.
+Three ways to run it, and one thing they all share: **the panel has no login.** Account API
+responses omit passwords, sessions and access tokens, but a caller with access can still edit
+accounts and trigger actions. Keep the service private or behind an authenticated proxy.
+The SQLite database still stores credentials in plaintext; POSIX database and backup files
+are restricted to mode 0600 and newly created data directories to 0700.
 
 Pick a way:
 
@@ -27,8 +28,7 @@ start.bat
 Then open <http://127.0.0.1:8000>. The window has to stay open — closing it stops the scheduler,
 and nothing warns you.
 
-`run.py` binds `0.0.0.0` by default, which means **anyone on your network can open it**. If you
-are not deliberately reaching it from a phone or another machine, set `PANEL_HOST=127.0.0.1`:
+`run.py` binds `127.0.0.1` by default. You can also set it explicitly:
 
 ```bat
 set PANEL_HOST=127.0.0.1
@@ -52,7 +52,7 @@ The build in `dist\签到面板\` is movable — copy the whole folder anywhere.
 travel with it. The browser (~700MB) downloads on first use, in the background; every HTTP
 check-in works before it finishes.
 
-It binds `127.0.0.1` by default, unlike `run.py`.
+It binds `127.0.0.1` by default, like `run.py`.
 
 ## 3. The container
 
@@ -87,11 +87,9 @@ ports:
   - "127.0.0.1:8000:8000"     # only this machine
 ```
 
-Change it to `"8000:8000"` and the panel is on every interface your host has. Publishing that to
-the internet is not "exposing a dashboard" — it is **putting a plaintext credential viewer
-online**, because `GET /api/accounts` answers any caller with every account's password and
-session. Assume it is found: scanners reach a new open port in minutes, and there is no login
-to fail, no rate limit, and no log of who read what.
+Changing it to `"8000:8000"` publishes the panel on every host interface. Credential
+redaction and browser request checks do not authenticate callers: anyone who reaches the
+service can still invoke account-management and check-in actions. Keep the port private.
 
 So leave the line alone, and reach it one of these two ways instead.
 
@@ -105,13 +103,34 @@ required — any two of them without the third is not enough:
 
 1. **Authentication in front of the panel.** Basic auth is acceptable *only* over TLS; anything
    with real sessions is better. The panel itself will never ask for a password.
-2. **TLS.** Without it the credentials the panel returns cross the network in the clear, and so
-   does the password protecting it. Caddy does this by itself; with nginx use certbot.
+2. **TLS.** It protects credentials submitted to the panel and the password protecting it.
+   Caddy does this by itself; with nginx use certbot.
 3. **The panel still not published.** Keep `127.0.0.1:8000:8000` and have the proxy reach it
    over loopback (or put both on a Docker network and publish only the proxy). If the panel's own
    port is open, the proxy is decoration — anyone can go around it.
 
-A Caddy example that satisfies all three:
+Configure browser access before using a remote hostname or VPN address:
+
+```yaml
+environment:
+  PANEL_ALLOWED_ORIGINS: "https://panel.example.com"
+```
+
+This is a comma-separated list of exact HTTP(S) origins (scheme, hostname and optional
+port), without paths or wildcards. For a subpath deployment use the origin only, such as
+`https://panel.example.com`, not `/checkin/`. Localhost, 127.0.0.1 and ::1 remain allowed
+with arbitrary local ports. The configured hostnames are accepted by Host validation;
+write requests must match the actual origin or a configured origin. Cross-site/null Origin
+and `Sec-Fetch-Site: cross-site` requests are rejected. Forwarded Host headers do not
+expand this list. A proxy can preserve the configured Host or use a loopback upstream Host.
+
+CLI requests with no Origin are supported. These checks protect browser request boundaries,
+not user identity; they do not replace proxy authentication. Account API responses contain
+`has_password`, `has_session` and `has_access_token` flags instead of credentials. On update,
+omitting a credential preserves it; explicit null or an empty string clears it. The UI
+leaves credential inputs blank when editing and omits unchanged blank fields.
+
+A Caddy example with the origin above configured:
 
 ```
 panel.example.com {

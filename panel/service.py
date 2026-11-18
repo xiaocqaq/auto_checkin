@@ -231,17 +231,29 @@ class CheckInService:
 				except Exception as e:  # network/browser/anything — one account must not kill a batch
 					outcome = newapi.Outcome(False, error=newapi.why(e))
 
-			await self._reconcile(account, outcome, started, site)
-
+			# Browser fallbacks may have replaced or explicitly cleared stored credentials.
+			account = self.store.get(account_id) or account
 			updates = {}
 			if outcome.session and outcome.session != account.session:
 				updates['session'] = outcome.session
 			if outcome.api_user and str(outcome.api_user) != (account.api_user or ''):
 				updates['api_user'] = str(outcome.api_user)
+			if outcome.access_token and outcome.access_token != account.access_token:
+				updates['access_token'] = outcome.access_token
 			if outcome.username and not account.username:
 				updates['username'] = outcome.username
 			if updates:
 				self.store.update(account_id, **updates)
+
+			# Persist rotating credentials before optional remote read-back. A malformed
+			# reconciliation response must not lose them or partially rewrite the result.
+			confirmed = replace(outcome)
+			try:
+				await self._reconcile(self.store.get(account_id) or account, confirmed, started, site)
+			except Exception:
+				pass  # Keep the original attempt result when optional confirmation is unavailable.
+			else:
+				outcome = confirmed
 
 			quota = outcome.after_quota if outcome.after_quota is not None else outcome.before_quota
 			self.store.record_result(
@@ -272,6 +284,9 @@ class CheckInService:
 		stays true all day. An entry from this run is 签到成功, an older one from today is
 		今日已签到, and no entry today means the login worked but the bonus did not land.
 		"""
+		if site is not None and site.backend in {'vyce', 'sub2api'}:
+			# Native adapters own their status schema; New API logs cannot corroborate it.
+			return
 		if account.mechanism == 'visit' and _open_only_visit(account):
 			# The open-only browser already checked its type-1 Daily allowance with the SPA Bearer.
 			# Generic check-in status/type-4 logs cannot confirm or overrule that receipt.
@@ -328,6 +343,7 @@ class CheckInService:
 		from panel import vyce
 
 		if await vyce.looks_like_vyce(account.base_url):
+			site = replace(site, backend='vyce')
 			outcome = await vyce.check_in(login)
 			return outcome, site
 		# 本机部署：Sub2API（relay7 / relay6 这类）是第三套
@@ -336,6 +352,7 @@ class CheckInService:
 		from panel import sub2api
 
 		if await sub2api.looks_like_sub2api(account.base_url):
+			site = replace(site, backend='sub2api')
 			outcome = await sub2api.check_in(login)
 			return outcome, site
 		if account.mechanism == 'visit' and (not site.checkin_path or _open_only_visit(account)):
@@ -469,11 +486,11 @@ class CheckInService:
 				gained = None
 			return newapi.Outcome(success=True, checked_in=gained, **common)
 		if visit.checkin_at is not None:  # the ledger can speak, so it decides
-			landed = visit.checkin_at >= window_start(account)
+			landed = visit.checkin_at >= _today_start()
 			return newapi.Outcome(
 				success=landed,
 				checked_in=visit.checkin_at >= started if landed else False,
-				error=None if landed else '登录成功，但站点额度明细里这一轮没有签到记录',
+				error=None if landed else '登录成功，但站点额度明细里今天没有签到记录',
 				**common,
 			)
 		return newapi.Outcome(
@@ -507,13 +524,15 @@ class CheckInService:
 			)
 		except Exception:
 			return False
-		if result.credential:
+		new_token = getattr(result, 'access_token', None)
+		if result.credential or new_token:
 			self.store.update(
 				account.id,
-				session=result.credential,
+				session=result.credential or '',
+				access_token=new_token or '',
 				api_user=str(result.user.get('id') or '') or None,
 			)
-		return bool(result.credential)
+		return bool(result.credential or new_token)
 
 	async def _with_turnstile(
 		self, account: Account, site: newapi.SiteInfo, login: newapi.Login, failed: newapi.Outcome
@@ -528,7 +547,11 @@ class CheckInService:
 		)
 		if not token:
 			return failed
-		retry = replace(login, session=failed.session or login.session, turnstile=token)
+		retry = replace(
+			login, session=failed.session or login.session,
+			access_token=failed.access_token or login.access_token,
+			api_user=failed.api_user or login.api_user, turnstile=token,
+		)
 		return await newapi.check_in(retry, site)
 
 	async def _browser_check_in(
@@ -558,14 +581,16 @@ class CheckInService:
 		)
 		session, user = result.credential, result.user
 		api_user = user.get('id') or account.api_user
-		self.store.update(account.id, session=session, api_user=api_user)
+		new_token = getattr(result, 'access_token', None)
+		self.store.update(account.id, session=session or '', api_user=api_user, access_token=new_token or '')
 		if site.checkin_path:  # the login only got us in; the check-in is still a POST
-			# Drop the stored access token: the browser hop just won a fresh session, and
+			# Drop only the historical token; carry a token won by this browser login.
+			# The browser hop just won fresh credentials, and
 			# `_client` sends both credentials at once — an `Authorization` header the site
 			# rejects is fatal even beside a good cookie, because New API's middleware
 			# answers "access token 无效" instead of falling back to the session (measured on
 			# relay14). A stale pasted token would otherwise block its own fallback.
-			login = replace(self._login(account), session=session, api_user=api_user, access_token=None)
+			login = replace(self._login(account), session=session, api_user=api_user, access_token=new_token)
 			outcome = await newapi.check_in(login, site)
 			if not outcome.success and site.turnstile_key and TURNSTILE_MISSING.search(outcome.error or ''):
 				# Mint in a *fresh* context (that is what `_with_turnstile` does): this
@@ -576,9 +601,10 @@ class CheckInService:
 					outcome.error = '站点签到要 Turnstile，这次浏览器里没拿到 token（Cloudflare 没给），下一轮会重试'
 			return outcome
 		after = None
-		bearer = None
-		if site.refresh_path:  # a JWT fork: the token exchange reports the balance itself
-			bearer, rotated, fresh = await newapi.refresh_access(account.base_url, session)
+		bearer = new_token
+		if site.refresh_path and session and not bearer:  # a JWT fork: the token exchange reports the balance itself
+			token, rotated, fresh = await newapi.refresh_access(account.base_url, session)
+			bearer = f'Bearer {token}' if token else None
 			if rotated:
 				session = rotated  # it rotates on every exchange; keep the live one
 				self.store.update(account.id, session=session)
@@ -588,6 +614,7 @@ class CheckInService:
 			after = await newapi.balance(
 				account.base_url,
 				session=session,
+				access_token=bearer,
 				api_user=api_user,
 				quota_per_unit=site.quota_per_unit,
 			)
@@ -596,7 +623,6 @@ class CheckInService:
 			# The login response the SPA kept is then the only reading there is, and it
 			# often carries quota=0 — which is a missing number, not a zero balance.
 			after = newapi.usd(user, site.quota_per_unit) or None
-		bearer = f'Bearer {bearer}' if bearer else None
 		# The site says whether today's bonus landed if it can; otherwise the balance
 		# moving across the login is the only signal.
 		checked_in = (
@@ -655,7 +681,7 @@ class CheckInService:
 		except Exception as e:
 			return CredentialCheck(False, reason=f'无法访问站点，凭据没能验证：{newapi.why(e)}')
 
-		value, kind = account.session, 'session'
+		value, kind = account.session, (newapi.REFRESH_COOKIE if site.refresh_path else 'session')
 		if candidates:
 			# A JWT fork authenticates only with its refresh cookie and ignores any session
 			# beside it; everywhere else it is the other way round. The paste cannot know
@@ -663,6 +689,8 @@ class CheckInService:
 			wanted = newapi.REFRESH_COOKIE if site.refresh_path else 'session'
 			picked = next((c for c in candidates if c.cookie_name == wanted), candidates[0])
 			value, kind = picked.value, picked.cookie_name
+			if site.refresh_path and len(candidates) == 1 and getattr(picked, 'is_bare', False):
+				kind = newapi.REFRESH_COOKIE
 			if value != account.session:
 				self.store.update(account_id, session=value)
 		# An access-token account authenticates with a header rather than a cookie, and which
@@ -766,11 +794,12 @@ class CheckInService:
 			)
 		finally:
 			self._importing.discard(account_id)
-		if result.credential:
+		new_token = getattr(result, 'access_token', None)
+		if result.credential or new_token:
 			# The verification logged in for real, so it came back with a live site session
 			# and the account's id. Storing them makes the account usable now rather than
 			# after the next scheduled run.
-			self.store.update(account_id, session=result.credential, api_user=str(result.api_user or '') or None)
+			self.store.update(account_id, session=result.credential or '', access_token=new_token or '', api_user=str(result.api_user or '') or None)
 		return result
 
 	def delete(self, account_id: int, *, forget_profile: bool = True) -> bool:

@@ -1,22 +1,22 @@
 """FastAPI application for the Check-in Panel.
 
-Serves the REST API and (in production) the built React frontend. There is **no
-authentication layer** (ADR-0003), and `/api/accounts` hands back whole `Account`
-rows — passwords and sessions included. Whatever the panel is bound to is therefore
-the trust boundary, and it is not always loopback: `run.py` defaults to `0.0.0.0`
-(LAN-reachable) while the container defaults to `127.0.0.1`. Publishing the port to
-an untrusted network publishes the credentials with it.
+Serves the API and built frontend. Credentials are write-only. Loopback Host and
+same-origin browser checks protect the default local deployment. This is still a
+single-user application without authentication: remote use requires an authenticated
+reverse proxy/private network and explicitly configured PANEL_ALLOWED_ORIGINS.
 """
 import asyncio
+import os
 import re
 import sqlite3
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlsplit
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -46,6 +46,37 @@ class AccountPatch(AccountIn):
 	name: Optional[str] = None
 	base_url: Optional[str] = None
 	login_method: Optional[str] = None
+
+
+class AccountOut(BaseModel):
+	"""Public account fields only; storage additions are not implicitly exposed."""
+	id: int
+	name: str
+	base_url: str
+	login_method: str
+	mechanism: Optional[str]
+	username: Optional[str]
+	api_user: Optional[str]
+	checkin_after: Optional[str]
+	avatar_color: Optional[str]
+	avatar_shape: Optional[str]
+	enabled: bool
+	last_run_at: Optional[str]
+	last_success: Optional[bool]
+	last_checked_in: Optional[bool]
+	last_quota: Optional[float]
+	last_error: Optional[str]
+	failures: int
+	created_at: Optional[str]
+	updated_at: Optional[str]
+	has_password: bool
+	has_session: bool
+	has_access_token: bool
+
+
+class AccountSavedOut(BaseModel):
+	account: AccountOut
+	credential: Optional[dict]
 
 
 class IdsIn(BaseModel):
@@ -83,6 +114,11 @@ DUPLICATE = '这个网站下已经有同名账号了；换个名称（名称也�
 
 def _check(payload: AccountIn) -> dict:
 	fields = payload.model_dump(exclude_none=True)
+	# PATCH semantics: omission preserves; explicit null clears a credential.
+	if isinstance(payload, AccountPatch):
+		for key in ('password', 'session', 'access_token'):
+			if key in payload.model_fields_set:
+				fields[key] = getattr(payload, key) or ''
 	url = fields.get('base_url')
 	if url is not None and not str(url).startswith(('http://', 'https://')):
 		raise HTTPException(status_code=422, detail='base_url 必须以 http:// 或 https:// 开头')
@@ -125,6 +161,14 @@ def _pasted(fields: dict) -> Optional[list[newapi.PastedCredential]]:
 	return candidates
 
 
+def _account(account) -> dict:
+	"""Only credential presence crosses the API; omitted edit fields preserve stored values."""
+	body = asdict(account)
+	for key in ('password', 'session', 'access_token'):
+		body[f'has_{key}'] = bool(body.pop(key, None))
+	return AccountOut.model_validate(body).model_dump()
+
+
 def _outcome(outcome: newapi.Outcome) -> dict:
 	body = asdict(outcome)
 	body.pop('session', None)  # never hand a session back to the browser
@@ -159,6 +203,35 @@ def create_app(
 				await asyncio.gather(task, return_exceptions=True)
 
 	app = FastAPI(title='Check-in Panel', lifespan=lifespan)
+	# Exact public origins explicitly configured by the operator also authorize their Host.
+	# A proxy can preserve Host or forward to loopback; no forwarded header grants trust.
+	allowed_origins = {item.strip().rstrip('/') for item in os.getenv('PANEL_ALLOWED_ORIGINS', '').split(',') if item.strip()}
+	trusted_hosts = {'localhost', '127.0.0.1', '::1'}
+	for origin in allowed_origins:
+		parsed = urlsplit(origin)
+		if parsed.scheme not in ('http', 'https') or not parsed.hostname or parsed.username or parsed.password or parsed.path or parsed.query or parsed.fragment or '*' in origin:
+			raise ValueError('PANEL_ALLOWED_ORIGINS must contain exact http(s) origins')
+		trusted_hosts.add(parsed.hostname)
+
+	@app.middleware('http')
+	async def browser_boundary(request: Request, call_next):
+		try:
+			host = urlsplit('//' + request.headers.get('host', ''))
+			valid_host = host.hostname in trusted_hosts and not host.username and not host.password and not host.path and not host.query and not host.fragment
+			_ = host.port  # Reject malformed ports as well.
+		except ValueError:
+			valid_host = False
+		if not valid_host:
+			return JSONResponse({'detail': 'Untrusted Host'}, status_code=400)
+		if request.method not in ('GET', 'HEAD', 'OPTIONS'):
+			origin = request.headers.get('origin')
+			local_origin = f'{request.url.scheme}://{request.headers["host"]}'
+			if request.headers.get('sec-fetch-site') == 'cross-site' or (origin is not None and origin not in allowed_origins and origin != local_origin):
+				return JSONResponse({'detail': 'Cross-origin request refused'}, status_code=403)
+		response = await call_next(request)
+		if request.url.path.startswith('/api/'):
+			response.headers['Cache-Control'] = 'no-store'
+		return response
 
 	def _require(account_id: int):
 		account = store.get(account_id)
@@ -183,20 +256,20 @@ def create_app(
 		until tomorrow's failed run.
 		"""
 		if not candidates and not fields.get('access_token'):
-			return {'account': asdict(_require(account_id)), 'credential': None}
+			return {'account': _account(_require(account_id)), 'credential': None}
 		try:
 			check = await service.verify_credential(account_id, candidates)
 		except Exception as e:  # a probe that failed must not lose the account that was saved
 			check = CredentialCheck(False, reason=f'凭据没能验证：{newapi.why(e)}')
 		body = asdict(check)
 		body['warning'] = None if check.ok else check.reason
-		return {'account': asdict(_require(account_id)), 'credential': body}
+		return {'account': _account(_require(account_id)), 'credential': body}
 
-	@app.get('/api/accounts')
+	@app.get('/api/accounts', response_model=list[AccountOut])
 	def list_accounts():
-		return [asdict(a) for a in store.list()]
+		return [_account(a) for a in store.list()]
 
-	@app.post('/api/accounts', status_code=201)
+	@app.post('/api/accounts', status_code=201, response_model=AccountSavedOut)
 	async def create_account(payload: AccountIn):
 		fields = _check(payload)
 		candidates = _pasted(fields)
@@ -206,20 +279,20 @@ def create_app(
 			raise HTTPException(status_code=409, detail=DUPLICATE) from None
 		return await _with_credential(account.id, candidates, fields)
 
-	@app.get('/api/accounts/{account_id}')
+	@app.get('/api/accounts/{account_id}', response_model=AccountOut)
 	def get_account(account_id: int):
-		return asdict(_require(account_id))
+		return _account(_require(account_id))
 
-	@app.put('/api/accounts/{account_id}')
+	@app.put('/api/accounts/{account_id}', response_model=AccountSavedOut)
 	async def update_account(account_id: int, payload: AccountPatch):
 		before = _require(account_id)
 		fields = _check(payload)
 		candidates = _pasted(fields)
 		# Verifying costs something on a JWT fork: the check *spends* the refresh cookie and
 		# rotates it, which logs out everyone else holding that value — including the owner's
-		# own browser. The edit form loads the stored credential into its fields and submits it
-		# back untouched, so a rename would otherwise burn a rotation and a login. Only a
-		# credential that actually changed is a paste worth checking; `checkable` therefore
+		# own browser. The UI now omits unchanged credentials, but older clients and CLI callers
+		# can still explicitly resubmit the same value. Do not burn a rotation for that rename.
+		# Only a changed credential is worth checking; `checkable` therefore
 		# carries what this request *changed*, while `fields` still carries everything to store.
 		checkable = dict(fields)
 		if candidates and fields.get('session') == before.session:
@@ -317,7 +390,7 @@ def create_app(
 			)
 		except Exception as e:
 			raise HTTPException(status_code=409 if isinstance(e, ProfileBusyError) else 400, detail=newapi.why(e)) from e
-		store.update(account_id, session=result.credential, api_user=result.user.get('id'))
+		store.update(account_id, session=result.credential, api_user=result.user.get('id'), access_token=result.access_token or '')
 		# The credential just changed, so the stored result describes a run made with the old
 		# one — leaving it makes the list show 「refresh 凭据已失效」 beside an account that has
 		# since logged in fine. Back to unknown, not to success: no check-in happened here, and
@@ -358,7 +431,7 @@ def create_app(
 			raise HTTPException(status_code=409 if isinstance(e, ProfileBusyError) else 400, detail=newapi.why(e)) from e
 		# The site session the verification won is already stored; it must not travel back.
 		# This API never hands a credential to the browser, and the caller has no use for it.
-		return {k: v for k, v in asdict(result).items() if k != 'credential'}
+		return {k: v for k, v in asdict(result).items() if k not in ('credential', 'access_token')}
 
 	@app.get('/api/promos')
 	async def promos():

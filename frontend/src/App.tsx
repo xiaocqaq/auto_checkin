@@ -99,7 +99,7 @@ function statusChip(acc: Account): ChipState {
 
 /** OAuth-only account with no password yet — it needs the one-time browser hop. */
 const needsBrowser = (acc: Account) =>
-  (acc.login_method === 'linuxdo' || acc.login_method === 'github') && !(acc.username && acc.password)
+  (acc.login_method === 'linuxdo' || acc.login_method === 'github') && !(acc.username && acc.has_password)
 
 type RowAction = { key: string; label: string; color: 'default' | 'secondary' | 'danger'; run: () => void }
 
@@ -351,7 +351,7 @@ export default function App() {
         ...(needsBrowser(acc)
           ? [{ key: 'inject', label: '注入会话', color: 'secondary' as const, run: () => openInject(acc) }]
           : []),
-        ...(acc.session && !(acc.username && acc.password)
+        ...(acc.has_session && !(acc.username && acc.has_password)
           ? [{ key: 'bootstrap', label: '设置密码', color: 'default' as const, run: () => void bootstrap(acc) }]
           : []),
         { key: 'edit', label: '编辑', color: 'default', run: () => openForm(acc) },
@@ -538,7 +538,7 @@ export default function App() {
                         <span className="inline-flex items-center gap-1">
                           <method.Icon className="shrink-0 text-default-400" />
                           {method.label}
-                          {acc.username && acc.password && <span className="text-success">✓</span>}
+                          {acc.username && acc.has_password && <span className="text-success">✓</span>}
                         </span>
                         <span className="font-mono tabular-nums text-default-600">{money(acc.last_quota)}</span>
                         <span className="font-mono tabular-nums text-default-400">{runAt(acc.last_run_at)}</span>
@@ -618,7 +618,7 @@ export default function App() {
                         <span className="inline-flex items-center gap-1.5">
                           <method.Icon className="shrink-0 text-default-400" />
                           {method.label}
-                          {acc.username && acc.password && (
+                          {acc.username && acc.has_password && (
                             <Tooltip content="已有账号密码，签到走纯 HTTP，不开浏览器">
                               <span className="text-success">✓</span>
                             </Tooltip>

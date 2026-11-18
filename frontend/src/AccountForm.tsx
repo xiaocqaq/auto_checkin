@@ -14,6 +14,8 @@ import {
 } from '@heroui/react'
 import {
   api,
+  credentialPatch,
+  type CredentialField,
   type Account,
   type AccountInput,
   type AccountSaved,
@@ -136,6 +138,7 @@ export default function AccountForm({ account, isOpen, onClose, onSaved }: Accou
   const [probing, setProbing] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
+  const [clearCredentials, setClearCredentials] = useState<CredentialField[]>([])
 
   useEffect(() => {
     if (!isOpen) return
@@ -144,9 +147,10 @@ export default function AccountForm({ account, isOpen, onClose, onSaved }: Accou
     setMethod(account?.login_method ?? 'password')
     setMechanism(account?.mechanism ?? 'auto')
     setUsername(account?.username ?? '')
-    setPassword(account?.password ?? '')
-    setAccessToken(account?.access_token ?? '')
-    setSession(account?.session ?? '')
+    setPassword('')
+    setAccessToken('')
+    setSession('')
+    setClearCredentials([])
     setApiUser(account?.api_user ?? '')
     setCheckinAfter(account?.checkin_after ?? '')
     setEnabled(account?.enabled ?? true)
@@ -208,9 +212,7 @@ export default function AccountForm({ account, isOpen, onClose, onSaved }: Accou
         login_method: method,
         mechanism,
         username: username || undefined,
-        password: password || undefined,
-        access_token: accessToken || undefined,
-        session: session || undefined,
+        ...credentialPatch({ password, access_token: accessToken, session }, clearCredentials),
         api_user: apiUser || undefined,
         checkin_after: checkinAfter || undefined,
         enabled,
@@ -297,6 +299,17 @@ export default function AccountForm({ account, isOpen, onClose, onSaved }: Accou
                   <SelectItem key={m}>{METHOD_LABELS[m]}</SelectItem>
                 ))}
               </Select>
+              {account && (
+                <div className="space-y-2 text-xs text-default-500">
+                  <p>凭据不会回显；留空保留已存凭据，输入新值替换。勾选清除后保存才会删除。</p>
+                  {(['password', 'session', 'access_token'] as const).filter((key) => account['has_' + key as 'has_password' | 'has_session' | 'has_access_token']).map((key) => (
+                    <Switch key={key} size="sm" isSelected={clearCredentials.includes(key)}
+                      onValueChange={(clear) => setClearCredentials((previous) => clear ? [...previous, key] : previous.filter((item) => item !== key))}>
+                      清除已存{key === 'password' ? '密码' : key === 'session' ? '会话 Cookie' : 'Access Token'}
+                    </Switch>
+                  ))}
+                </div>
+              )}
               {method === 'password' && (
                 <>
                   <Input

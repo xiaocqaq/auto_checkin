@@ -296,9 +296,34 @@ def test_a_refused_paste_says_what_it_did_find():
 		newapi.credentials_from_paste(JAR_WITH_NEITHER)
 
 
+@pytest.mark.parametrize('raw, name, value, bare', [
+	('opaque==', 'session', 'opaque==', True),
+	('session=opaque==; other=x', 'session', 'opaque==', False),
+	('new_api_refresh=opaque==', newapi.REFRESH_COOKIE, 'opaque==', False),
+	(JAR_WITH_SESSION, 'session', 'MTc1.REAL', False),
+])
+def test_paste_preserves_explicit_cookie_source(raw, name, value, bare):
+	credential, = newapi.credentials_from_paste(raw)
+	assert (credential.cookie_name, credential.value) == (name, value)
+	assert getattr(credential, 'is_bare', None) is bare
+
+
 def test_broken_json_is_reported_as_broken_json():
 	with pytest.raises(ValueError, match='JSON'):
 		newapi.credentials_from_paste('[{"name": "session", "value": ')
+
+
+@pytest.mark.parametrize('backend', ['newapi', 'vyce', 'sub2api'])
+async def test_probe_identifies_backend(site, monkeypatch, backend):
+	from panel import vyce, sub2api
+	async def is_vyce(_):
+		return backend == 'vyce'
+	async def is_sub2api(_):
+		return backend == 'sub2api'
+	monkeypatch.setattr(vyce, 'looks_like_vyce', is_vyce)
+	monkeypatch.setattr(sub2api, 'looks_like_sub2api', is_sub2api)
+	info = await newapi.probe('https://x.test')
+	assert getattr(info, 'backend', None) == backend
 
 
 async def test_probe_reports_capabilities_and_login_bonus(site):
@@ -434,6 +459,49 @@ async def test_a_refresh_cookie_is_spent_for_a_bearer_token(site):
 	assert site.quota == 625_000.0
 
 
+@pytest.mark.parametrize('token, refreshes', [('expired', 1), ('jwt-access', 0)])
+async def test_saved_bearer_refreshes_only_when_invalid(site, token, refreshes):
+	site.checkin_path, site.refresh = '/api/user/checkin', 'r1'
+	info = newapi.SiteInfo(base_url='https://x.test', checkin_path=site.checkin_path, refresh_path=newapi.REFRESH_PATH)
+	outcome = await newapi.check_in(newapi.Login(base_url='https://x.test', session='r1', access_token=token), info)
+	assert outcome.success is True
+	assert outcome.access_token == 'jwt-access'
+	assert site.calls.count(f'POST {newapi.REFRESH_PATH}') == refreshes
+	assert outcome.session == ('r1-rotated' if refreshes else 'r1')
+
+
+async def test_newly_refreshed_bearer_is_not_refreshed_again(site, monkeypatch):
+	site.checkin_path, site.refresh = '/api/user/checkin', 'r1'
+	monkeypatch.setattr(site, '_authed', lambda request: False)
+	info = newapi.SiteInfo(base_url='https://x.test', checkin_path=site.checkin_path, refresh_path=newapi.REFRESH_PATH)
+	outcome = await newapi.check_in(newapi.Login(base_url='https://x.test', session='r1'), info)
+	assert outcome.success is False
+	assert outcome.session == 'r1-rotated'
+	assert site.calls.count(f'POST {newapi.REFRESH_PATH}') == 1
+
+
+async def test_refresh_without_token_keeps_rotation_when_password_fallback_fails(site, monkeypatch):
+	site.checkin_path, site.refresh = '/api/user/checkin', 'r1'
+	site.access_token = None
+	monkeypatch.setattr(site, '_authed', lambda request: False)
+	info = newapi.SiteInfo(base_url='https://x.test', checkin_path=site.checkin_path, refresh_path=newapi.REFRESH_PATH)
+	outcome = await newapi.check_in(newapi.Login(base_url='https://x.test', session='r1', username='alice', password='wrong'), info)
+	assert outcome.success is False
+	assert outcome.session == 'r1-rotated'
+
+
+async def test_refresh_without_token_keeps_rotated_cookie(site):
+	site.checkin_path, site.refresh = '/api/user/checkin', 'r1'
+	site.access_token = None
+	info = newapi.SiteInfo(base_url='https://x.test', checkin_path=site.checkin_path, refresh_path=newapi.REFRESH_PATH)
+
+	outcome = await newapi.check_in(newapi.Login(base_url='https://x.test', session='r1'), info)
+
+	assert outcome.success is False
+	assert outcome.session == 'r1-rotated'
+	assert site.checked_in is False
+
+
 async def test_a_dead_refresh_cookie_says_what_to_paste(site):
 	site.checkin_path, site.refresh = '/api/user/checkin', 'r1'
 	info = await newapi.probe('https://x.test')
@@ -509,6 +577,40 @@ async def test_login_bonus_without_session_still_reports_balance(site):
 	outcome = await newapi.check_in(login(site))
 	assert (outcome.success, outcome.checked_in) == (True, True)
 	assert (outcome.before_quota, outcome.after_quota, outcome.delta) == (None, 1.25, None)
+
+
+async def test_login_bonus_returns_body_token_for_readback(site):
+	site.body_token = True
+	outcome = await newapi.check_in(login(site), newapi.SiteInfo(base_url='https://x.test'))
+	assert outcome.success is True
+	assert outcome.access_token == 'jwt-access'
+
+
+@pytest.mark.parametrize('password', [None, 'wrong'])
+async def test_login_bonus_early_failure_keeps_refreshed_credentials(site, password):
+	site.refresh = 'r1'
+	info = newapi.SiteInfo(base_url='https://x.test', refresh_path=newapi.REFRESH_PATH)
+	credentials = newapi.Login(base_url='https://x.test', session='r1', username='alice', password=password)
+	outcome = await newapi.check_in(credentials, info)
+	assert outcome.success is False
+	assert outcome.session == 'r1-rotated'
+	assert outcome.access_token == 'jwt-access'
+
+
+async def test_login_bonus_body_only_login_keeps_prior_refresh_rotation(site, monkeypatch):
+	site.refresh = 'r1'
+	site.body_token = True
+	original = site.handler
+	def handler(request):
+		response = original(request)
+		if request.url.path == '/api/user/login':
+			response.headers.pop('set-cookie', None)
+		return response
+	monkeypatch.setattr(site, 'handler', handler)
+	outcome = await newapi.check_in(login(site, session='r1'), newapi.SiteInfo(base_url='https://x.test', refresh_path=newapi.REFRESH_PATH))
+	assert outcome.success is True
+	assert outcome.session == 'r1-rotated'
+	assert outcome.access_token == 'jwt-access'
 
 
 async def test_login_bonus_without_password_says_what_can_be_done(site):

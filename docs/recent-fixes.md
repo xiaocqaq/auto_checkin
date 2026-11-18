@@ -1,5 +1,17 @@
 # 近期修复与可选站点适配
 
+## 审查修复（2026-11-18）
+
+- Python 3.12/3.13 的类内类型注解遮蔽问题已修复；测试发现路径仅包含实际存在的目录。
+- 浏览器登录捕获目标站点成功响应体里的新 Bearer，支持无 Cookie 的 token-only 登录；手动验证、签到回退和后续保存均保留新凭据。
+- HTTP refresh 即使未返回 access token，也保留轮换后的 refresh cookie；有效 Bearer 不额外刷新，失效 Bearer 仅刷新一次。
+- 浏览器奖励记录按本地自然日判断，`checkin_after` 仅控制何时开始尝试。
+- 账号响应通过白名单模型剔除凭据，默认控制台监听回环，新增 Host/Origin 检查。远程部署必须配置 `PANEL_ALLOWED_ORIGINS` 并保留代理认证，参见 [部署说明](deploying.md)。
+- POSIX 数据库、备份和已有 SQLite sidecar 收紧为 0600，新建数据目录为 0700；这不等同于数据库加密或 Windows ACL 设置。
+- refresh 站点的唯一裸字符串候选按 refresh 处理，显式 session/header/JSON 保持原类型。
+- 验证码失败返回不含供应商响应、密钥或答案的错误摘要；调试日志不记录识别答案。
+- vyce / Sub2API 由各自适配器判断状态，跳过不兼容的 New API status/log 核验。
+
 ## 浏览器与会话
 
 - 同一持久化浏览器 profile 不再并发启动；关闭和取消时保留占用锁直到清理完成，不删除仍被使用或无法确认归属的 Chromium 锁。

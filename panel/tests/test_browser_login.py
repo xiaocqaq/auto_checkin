@@ -46,6 +46,17 @@ class FakeContext:
 		self.closed = False
 		self.settings = None  # what browser_login asked to launch
 		self.launch_kwargs = {}
+		self.listeners = {}
+
+	def on(self, event, handler):
+		self.listeners.setdefault(event, []).append(handler)
+
+	def remove_listener(self, event, handler):
+		self.listeners[event].remove(handler)
+
+	def emit(self, event, value):
+		for handler in self.listeners.get(event, []):
+			handler(value)
 
 	async def cookies(self):
 		return list(self._cookies)
@@ -134,6 +145,139 @@ async def _login(headless=True):
 	return found.credential, found.user
 
 
+@dataclass
+class LoginResponse:
+	url: str = SITE + '/api/oauth/github'
+	ok: bool = True
+	body: object = field(default_factory=lambda: {'success': True, 'data': {'user': USER, 'access_token': 'fresh-jwt'}})
+	reads: int = 0
+
+	async def json(self):
+		self.reads += 1
+		await real_sleep(0)  # response headers arrive before the body
+		if isinstance(self.body, Exception):
+			raise self.body
+		return self.body
+
+
+@pytest.fixture
+def body_login(browser, monkeypatch):
+	context, grants, _ = browser
+	responses = [LoginResponse()]
+	click = bl._click_first
+
+	async def emit_login(page, texts, **kwargs):
+		result = await click(page, texts, **kwargs)
+		page.storage.clear()  # JWT forks need not persist localStorage.user
+		for response in responses:
+			context.emit('response', response)
+		return result
+
+	monkeypatch.setattr(bl, '_click_first', emit_login)
+	return context, grants, responses
+
+
+async def test_body_only_oauth_login_returns_the_fresh_bearer(body_login):
+	context, _, responses = body_login
+	try:
+		found = await bl.browser_login(base_url=SITE, provider='github', account_name='A', headless=True)
+	except RuntimeError:
+		pytest.fail('a successful target-site OAuth body token must complete login without a cookie')
+	assert found.credential == ''
+	assert found.access_token == 'Bearer fresh-jwt'
+	assert found.user == USER
+	assert responses[0].reads == 1
+	assert not _site_cookies(context), 'successful body-only login must not restore stale cookies'
+	assert not context.listeners.get('response'), 'remove capture even for caller-owned contexts'
+	assert context.closed
+
+
+@pytest.mark.parametrize('path', ['/api/user/login', '/api/oauth/github/callback'])
+async def test_body_bearer_is_not_prefixed_twice(body_login, path):
+	_, _, responses = body_login
+	responses[0].url = SITE + path
+	responses[0].body = {'success': True, 'data': {**USER, 'access_token': 'Bearer fresh-jwt', 'refresh_token': 'private'}}
+	found = await bl.browser_login(base_url=SITE, provider='github', account_name='A', headless=True)
+	assert found.access_token == 'Bearer fresh-jwt'
+	assert found.user == USER
+
+
+async def test_body_token_without_embedded_user_preserves_cookie_login(body_login, monkeypatch):
+	_, grants, responses = body_login
+	grants.append({'name': 'session', 'value': LIVE, 'domain': 'site.test'})
+	responses[0].body = {'success': True, 'data': {'access_token': 'fresh-jwt'}}
+	async def user(*_, **__):
+		return USER
+	monkeypatch.setattr(bl, '_site_user', user)
+	found = await bl.browser_login(base_url=SITE, provider='github', account_name='A', headless=True)
+	assert found.credential == LIVE
+	assert found.access_token == 'Bearer fresh-jwt'
+	assert found.user == USER
+
+
+@pytest.mark.parametrize('url', [
+	'https://github.com/api/oauth/github', 'https://site.test.evil.test/api/oauth/github',
+	'http://site.test/api/oauth/github', 'https://site.test:444/api/oauth/github',
+	SITE + '/api/user/self', SITE + '/api/oauth/linuxdo', SITE + '/api/oauth/github/other',
+])
+async def test_unrelated_response_tokens_are_not_even_read(body_login, url):
+	context, _, responses = body_login
+	responses[0].url = url
+	with pytest.raises(RuntimeError):
+		await bl.browser_login(base_url=SITE, provider='github', account_name='A', headless=True)
+	assert responses[0].reads == 0
+	assert not context.listeners.get('response')
+	assert _site_cookies(context), 'failed login must restore the prior session'
+
+
+@pytest.mark.parametrize('ok,body', [
+	(False, {'success': True, 'data': {'user': USER, 'access_token': 'invalid'}}),
+	(True, {'success': False, 'data': {'user': USER, 'access_token': 'invalid'}}),
+	(True, {'success': 'true', 'data': {'user': USER, 'access_token': 'invalid'}}),
+	(True, {'success': True, 'data': {'user': USER, 'access_token': ''}}),
+	(True, {'success': True, 'data': {'user': USER, 'access_token': None}}),
+	(True, {'success': True, 'data': []}), (True, []),
+	(True, ValueError('not JSON')),
+])
+async def test_failed_or_malformed_responses_cannot_create_login(body_login, ok, body):
+	context, _, responses = body_login
+	responses[0].ok, responses[0].body = ok, body
+	with pytest.raises(RuntimeError):
+		await bl.browser_login(base_url=SITE, provider='github', account_name='A', headless=True)
+	assert not context.listeners.get('response')
+	assert _site_cookies(context)
+
+
+async def test_capture_is_removed_from_a_borrowed_context(body_login):
+	context, _, _ = body_login
+	found = await bl.browser_login(base_url=SITE, provider='github', account_name='A', headless=True, _context=context)
+	assert found.access_token == 'Bearer fresh-jwt'
+	assert not context.listeners.get('response')
+	assert not context.closed
+
+
+async def test_token_arriving_during_cookie_verification_is_not_lost(browser, monkeypatch):
+	context, grants, _ = browser
+	grants.append({'name': 'session', 'value': LIVE, 'domain': 'site.test'})
+	response = LoginResponse()
+	async def verify(*_, **__):
+		context.emit('response', response)
+		return USER
+	monkeypatch.setattr(bl.newapi, 'whoami', verify)
+	found = await bl.browser_login(base_url=SITE, provider='github', account_name='A', headless=True)
+	assert found.credential == LIVE
+	assert found.access_token == 'Bearer fresh-jwt'
+	assert response.reads == 1
+
+
+async def test_body_only_injection_preserves_the_won_bearer(body_login):
+	result = await bl.inject_idp_cookies(EXPORTED, provider='github', account_name='A', base_url=SITE)
+	assert result.verified is True
+	assert result.credential == ''
+	assert result.access_token == 'Bearer fresh-jwt'
+	assert result.api_user == str(USER_ID)
+
+
 async def test_returns_the_session_that_authenticates_not_the_first_one(browser):
 	context, grants, _ = browser
 	grants += [
@@ -208,16 +352,32 @@ async def test_a_waf_blocked_balance_comes_from_inside_the_page(browser, monkeyp
 	assert user['quota'] == 3_500_000, 'the balance must be the fresh one, not the stored 0'
 
 
-async def test_a_stale_spa_login_is_cleared_before_looking_for_the_button(browser):
+def _show_login_button_on(monkeypatch, login_path):
+	class Button:
+		def __init__(self, page):
+			self.page = page
+		@property
+		def first(self):
+			return self
+		async def is_visible(self):
+			return self.page.url == SITE + login_path
+	monkeypatch.setattr(FakePage, 'locator', lambda page, _: Button(page), raising=False)
+
+
+@pytest.mark.parametrize('login_path', ['/login', '/sign-in'])
+async def test_a_stale_spa_login_is_cleared_before_looking_for_the_button(browser, monkeypatch, login_path):
 	"""Cookies alone are not a logout: with localStorage still saying "logged in"
 	the SPA sends /login to /console and there is no OAuth button to click."""
+	_show_login_button_on(monkeypatch, login_path)
 	context, grants, clicks = browser
 	grants.append({'name': 'session', 'value': LIVE, 'domain': 'site.test'})
 
 	await _login()
 
 	assert clicks[0]['storage'] == {}, 'the stale SPA login must be gone before we look for the button'
-	assert context.pages[0].gotos == [f'{SITE}/login', f'{SITE}/login'], 'and /login revisited afterwards'
+	routes = [SITE + '/login'] + ([SITE + '/sign-in'] if login_path == '/sign-in' else [])
+	assert context.pages[0].gotos == routes * 2, 'both route discovery and post-logout discovery remain functional'
+	assert clicks[0]['url'] == SITE + login_path
 
 
 async def test_the_wait_is_bounded_by_the_clock_not_the_tick_count(browser, monkeypatch):
@@ -818,12 +978,14 @@ async def test_an_idp_stall_still_asks_for_a_visible_window(browser):
 	assert 'IdP' in said
 
 
-async def test_a_login_card_that_paints_before_its_status_arrives_gets_a_second_look(browser, monkeypatch):
+@pytest.mark.parametrize('login_path', ['/login', '/sign-in'])
+async def test_a_login_card_that_paints_before_its_status_arrives_gets_a_second_look(browser, monkeypatch, login_path):
 	"""Measured on relay8: the logout clears the cached site status, so the card's first
 	paint has no OAuth provider to offer and comes up as the email/password form instead. The
 	status lands a beat later and the card does not repaint — so the button is genuinely absent,
 	and the run reported the site had no LinuxDO login at all. One reload brings the chooser
 	back, because the status is cached again by then."""
+	_show_login_button_on(monkeypatch, login_path)
 	context, grants, clicks = browser
 	grants.append({'name': 'session', 'value': LIVE, 'domain': 'site.test'})
 	looks: list[str] = []
@@ -842,7 +1004,9 @@ async def test_a_login_card_that_paints_before_its_status_arrives_gets_a_second_
 
 	assert credential == LIVE, 'the second look has to actually complete the login'
 	assert len(looks) == 2, 'looked again rather than giving up on the first miss'
-	assert context.pages[0].gotos == [f'{SITE}/login'] * 3, 'and the extra look followed a reload'
+	routes = [SITE + '/login'] + ([SITE + '/sign-in'] if login_path == '/sign-in' else [])
+	assert context.pages[0].gotos == routes * 3, 'the extra look followed another complete route discovery'
+	assert looks == [SITE + login_path] * 2
 
 
 async def test_a_site_that_really_has_no_such_button_still_says_so(browser):
@@ -863,7 +1027,9 @@ async def test_a_site_that_really_has_no_such_button_still_says_so(browser):
 	finally:
 		module._click_first = original
 
-	assert context.pages[0].gotos == [f'{SITE}/login'] * 3, 'exactly one reload, not a loop'
+	assert context.pages[0].gotos == [SITE + '/login', SITE + '/sign-in'] * 3, 'both routes tried on exactly one retry, not a loop'
+	assert context.closed
+	assert not context.listeners.get('response')
 
 
 class CoveredButton:

@@ -37,7 +37,7 @@ def service(store):
 
 @pytest.fixture
 def client(store, service):
-	return TestClient(create_app(store=store, service=service))
+	return TestClient(create_app(store=store, service=service), base_url='http://127.0.0.1')
 
 
 def test_crud_round_trip(client, store, service):
@@ -368,7 +368,7 @@ def test_the_health_route_never_touches_an_account(client, store):
 
 
 def test_without_a_build_there_is_no_spa_but_the_api_still_answers(store, service):
-	client = TestClient(create_app(store=store, service=service, dist_dir=None))
+	client = TestClient(create_app(store=store, service=service, dist_dir=None), base_url='http://127.0.0.1')
 
 	assert client.get('/api/accounts').status_code == 200
 	assert client.get('/').status_code == 404
@@ -380,7 +380,7 @@ def test_a_built_frontend_is_served_and_unknown_account_paths_fall_back_to_it(tm
 	(dist / 'index.html').write_text('<div id=root></div>', encoding='utf-8')
 	(dist / 'assets' / 'app.js').write_text('console.log(1)', encoding='utf-8')
 
-	client = TestClient(create_app(store=store, service=service, dist_dir=dist))
+	client = TestClient(create_app(store=store, service=service, dist_dir=dist), base_url='http://127.0.0.1')
 
 	assert client.get('/').text == '<div id=root></div>'
 	assert client.get('/assets/app.js').status_code == 200
@@ -569,7 +569,7 @@ def test_injecting_with_no_browser_installed_is_a_reason_not_a_crash(store, monk
 	from panel.service import CheckInService
 
 	monkeypatch.setitem(sys.modules, 'panel.browser_login', None)
-	real = TestClient(create_app(store=store, service=CheckInService(store)))
+	real = TestClient(create_app(store=store, service=CheckInService(store)), base_url='http://127.0.0.1')
 	account = store.create(name='A', base_url='https://x.test', login_method='github')
 
 	response = real.post(f'/api/accounts/{account.id}/idp-cookies', json={'cookies': IDP_JAR})
@@ -582,7 +582,7 @@ def test_injecting_into_a_password_account_never_reaches_the_browser(store):
 	before any import or launch is attempted."""
 	from panel.service import CheckInService
 
-	real = TestClient(create_app(store=store, service=CheckInService(store)))
+	real = TestClient(create_app(store=store, service=CheckInService(store)), base_url='http://127.0.0.1')
 	account = store.create(name='A', base_url='https://x.test', login_method='password')
 
 	response = real.post(f'/api/accounts/{account.id}/idp-cookies', json={'cookies': IDP_JAR})

@@ -34,9 +34,9 @@ you can find them on screen.
 
 ## Read this first — it decides how you deploy
 
-**The panel has no login.** Anyone who can reach its port can read **every account's password
-and session in the clear** from `GET /api/accounts`. That is deliberate (ADR-0003: a
-single-user panel running on your own machine).
+**The panel has no login.** Account responses omit passwords, sessions and access tokens,
+but callers can still edit accounts and trigger actions. Use a private network or an
+authenticated reverse proxy. Credentials remain in the local SQLite database.
 
 So:
 
@@ -126,8 +126,8 @@ start.bat
 or `.venv\Scripts\python.exe run.py`. Close the window and the scheduler stops, with no
 warning of any kind.
 
-Note that `run.py` binds `0.0.0.0` by default (reachable on your LAN) and `start.bat` narrows it
-to `127.0.0.1` for you. If you run `run.py` directly, set `PANEL_HOST` yourself.
+Both `run.py` and `start.bat` bind `127.0.0.1` by default. Remote deployment requires explicit
+configuration; see [deployment security](docs/deploying.md).
 
 ## Installing from source
 
@@ -394,7 +394,8 @@ All optional.
 
 | Variable | Default | What it does |
 |---|---|---|
-| `PANEL_HOST` | `run.py`: `0.0.0.0` / desktop: `127.0.0.1` | bind address. **This is the trust boundary** |
+| `PANEL_HOST` | `127.0.0.1` | bind address; container image explicitly uses `0.0.0.0` inside its network |
+| `PANEL_ALLOWED_ORIGINS` | empty | comma-separated exact remote origins; see [deployment security](docs/deploying.md) |
 | `PANEL_PORT` | `8000` | port |
 | `PANEL_SCHEDULER` | on | `0` turns off the daily automatic check-in |
 | `PANEL_PROMO` | on | `0` turns off the promo card; nothing is fetched |

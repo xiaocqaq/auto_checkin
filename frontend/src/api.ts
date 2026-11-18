@@ -8,9 +8,9 @@ export interface Account {
   login_method: LoginMethod
   mechanism: Mechanism | null
   username: string | null
-  password: string | null
-  access_token: string | null
-  session: string | null
+  has_password: boolean
+  has_access_token: boolean
+  has_session: boolean
   api_user: string | null
   checkin_after: string | null
   enabled: boolean
@@ -32,14 +32,26 @@ export interface AccountInput {
   login_method?: LoginMethod
   mechanism?: Mechanism
   username?: string
-  password?: string
-  access_token?: string
-  session?: string
+  password?: string | null
+  access_token?: string | null
+  session?: string | null
   api_user?: string
   checkin_after?: string
   enabled?: boolean
   avatar_color?: string
   avatar_shape?: string
+}
+
+export type CredentialField = 'password' | 'session' | 'access_token'
+
+/** Empty fields preserve existing secrets; only an explicit clear removes one. */
+export function credentialPatch(values: Record<CredentialField, string>, clear: CredentialField[]): Partial<AccountInput> {
+  const patch: Partial<Record<CredentialField, string | null>> = {}
+  for (const key of ['password', 'session', 'access_token'] as const) {
+    if (clear.includes(key)) patch[key] = null
+    else if (values[key]) patch[key] = values[key]
+  }
+  return patch
 }
 
 export interface Outcome {

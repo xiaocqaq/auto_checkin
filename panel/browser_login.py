@@ -36,8 +36,9 @@ from panel import newapi
 class BrowserLogin:
 	"""What one browser hop won: the credential to store and who it belongs to."""
 
-	credential: str
+	credential: str  # empty when the successful login returned only a body token
 	user: dict
+	access_token: Optional[str] = None  # Authorization value won by this hop only
 
 
 @dataclass
@@ -1145,6 +1146,27 @@ async def _browser_login(
 	# the owner caused by asking for a login.
 	dropped: list[dict] = []
 	won = False
+	responses = []
+	token = None
+	token_user = {}
+	listening = False
+	target = urlsplit(base_url)
+	paths = (f'{target.path}/api/user/login', f'{target.path}/api/oauth/{provider}',
+		f'{target.path}/api/oauth/{provider}/callback')
+
+	def origin(value):
+		port = value.port if value.port is not None else (443 if value.scheme == 'https' else 80)
+		return value.scheme, value.hostname, port
+
+	def capture(response):
+		# Match the actual target origin, never substrings or the external IdP.
+		try:
+			url = urlsplit(response.url)
+			if origin(url) == origin(target) and not url.username and not url.password and url.path in paths and response.ok:
+				responses.append(response)
+		except (ValueError, TypeError):
+			pass
+
 	try:
 		# Before the browser is sent at the IdP: the profile's own Cloudflare state would otherwise
 		# make a managed challenge hang instead of clearing on its own. Scoped to the IdP hosts, so
@@ -1170,6 +1192,8 @@ async def _browser_login(
 		# reporting the site had no LinuxDO login at all. One reload fixes it, because by then
 		# the status is cached again. Costs nothing when the button was there the first time.
 		progress['phase'] = '点击授权登录'
+		context.on('response', capture)
+		listening = True
 		for attempt in range(2):
 			await _unblock_login(page, buttons)  # render, tick the terms box, clear what covers it
 			if await _click_first(page, buttons):
@@ -1196,13 +1220,36 @@ async def _browser_login(
 		while time.monotonic() < deadline:
 			progress['phase'] = '验证站点登录结果'
 			found = await _logged_in(context, base_url, root)
+			# Drain after verification too: its awaits may deliver the OAuth response.
+			while responses:
+				response = responses.pop(0)
+				try:
+					body = await response.json()
+				except Exception:  # HTML/WAF/closed responses are not login proof
+					continue
+				if not isinstance(body, dict) or body.get('success') is not True:
+					continue
+				data = body.get('data')
+				if not isinstance(data, dict):
+					continue
+				value = data.get('access_token')
+				user = data.get('user', data)
+				if isinstance(value, str) and value.strip():
+					token = value.strip()
+					if not token.lower().startswith('bearer '):
+						token = f'Bearer {token}'
+					token_user = {}
+					if isinstance(user, dict) and user.get('id'):
+						token_user = {key: val for key, val in user.items() if key not in ('access_token', 'refresh_token')}
+			if not found and token and token_user:
+				found = ('', token_user)
 			if found:
 				credential, user = found
 				# ponytail: this always re-logs in first, even when the profile is still
 				# logged in from yesterday — one OAuth round trip a day. Reuse the live
 				# session instead if the launch cost ever matters.
 				won = True  # a newer card is in the jar; do not put the old one back over it
-				return BrowserLogin(credential, user)
+				return BrowserLogin(credential, user, token)
 			turnstile_clicked = False
 			for open_page in list(context.pages):
 				if await _click_turnstile(open_page):
@@ -1337,6 +1384,8 @@ async def _browser_login(
 			f'当前页面: {" | ".join(parked)}'
 		)
 	finally:
+		if listening:
+			context.remove_listener('response', capture)
 		# Host names alone: paths, query parameters and fragments can carry OAuth secrets.
 		hosts = set()
 		for open_page in context.pages:
@@ -1430,6 +1479,7 @@ class IdpInjection:
 	api_user: Optional[str] = None
 	reason: Optional[str] = None  # why verification failed, in the owner's words
 	warning: Optional[str] = None
+	access_token: Optional[str] = None
 
 
 async def inject_idp_cookies(
@@ -1484,7 +1534,7 @@ async def inject_idp_cookies(
 				return IdpInjection(len(cookies), hosts, verified=False, reason=newapi.why(e), warning=warning)
 			return IdpInjection(
 				len(cookies), hosts, verified=True, credential=result.credential,
-				api_user=str(result.user.get('id') or '') or None, warning=warning,
+				api_user=str(result.user.get('id') or '') or None, warning=warning, access_token=result.access_token,
 			)
 	except TimeoutError as e:
 		if not budget.expired():

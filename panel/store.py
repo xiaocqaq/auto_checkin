@@ -5,6 +5,9 @@ sandboxed folder (ADR-0006). An account is identified by (name, base_url); the
 old built-in "provider" table is gone — a site is just its Base URL, and what it
 supports is discovered at run time (see panel/newapi.probe).
 """
+from __future__ import annotations
+
+import os
 import shutil
 import sqlite3
 from contextlib import contextmanager
@@ -170,11 +173,32 @@ def _to_account(row: sqlite3.Row) -> Account:
 class AccountStore:
 	def __init__(self, db_path: Path):
 		self.db_path = Path(db_path)
-		self.db_path.parent.mkdir(parents=True, exist_ok=True)
+		# mkdir(parents=True) applies mode only to the leaf directory.
+		# Create each missing directory privately, without chmod on existing parents.
+		missing = []
+		parent = self.db_path.parent
+		while not parent.exists():
+			missing.append(parent)
+			parent = parent.parent
+		for parent in reversed(missing):
+			parent.mkdir(mode=0o700, exist_ok=True)
 		self._init_db()
 
 	@contextmanager
 	def _conn(self):
+		# Create privately before SQLite can write; also tighten older databases.
+		fd = os.open(self.db_path, os.O_CREAT | os.O_RDWR, 0o600)
+		try:
+			os.chmod(self.db_path, 0o600)
+		finally:
+			os.close(fd)
+		# Existing sidecars may come from a build that created the DB as 0644.
+		# New SQLite sidecars inherit the now-private database mode.
+		for suffix in ('-journal', '-wal', '-shm'):
+			try:
+				Path(str(self.db_path) + suffix).chmod(0o600)
+			except FileNotFoundError:
+				pass
 		conn = sqlite3.connect(self.db_path)
 		conn.row_factory = sqlite3.Row
 		try:
@@ -184,15 +208,24 @@ class AccountStore:
 			conn.close()
 
 	def _init_db(self) -> None:
+		backup = self.db_path.with_suffix('.v1.bak')
+		try:
+			backup.chmod(0o600)
+		except FileNotFoundError:
+			pass
 		legacy = False
 		if self.db_path.exists():
 			with self._conn() as conn:
 				columns = [r[1] for r in conn.execute('PRAGMA table_info(accounts)')]
 			legacy = bool(columns) and 'provider' in columns
 		if legacy:
-			backup = self.db_path.with_suffix('.v1.bak')
-			if not backup.exists():
-				shutil.copy2(self.db_path, backup)
+			try:
+				fd = os.open(backup, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+			except FileExistsError:
+				backup.chmod(0o600)
+			else:
+				with open(fd, 'wb') as target, self.db_path.open('rb') as source:
+					shutil.copyfileobj(source, target)
 		with self._conn() as conn:
 			if legacy:
 				self._migrate_v1(conn)

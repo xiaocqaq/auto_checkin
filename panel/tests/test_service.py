@@ -1044,6 +1044,126 @@ async def test_a_stale_pasted_token_does_not_block_its_own_browser_fallback(
 	assert calls[1].session == 'oauth-session'
 
 
+@pytest.mark.parametrize('hour, expected', [(1, True), (-1, False)])
+async def test_browser_ledger_uses_calendar_day_not_attempt_gate(service, store, monkeypatch, hour, expected):
+	import panel.browser_login as browser_login
+	import panel.service as service_module
+
+	midnight = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+	monkeypatch.setattr(service_module.time, 'time', lambda: midnight + 12 * 3600)
+	monkeypatch.setattr(service_module, '_today_start', lambda: midnight)
+	async def visit(**_):
+		user = {'id': 7, 'quota': 1_000_000}
+		return browser_login.BrowserVisit(before=user, after=user, session='live', checkin_at=midnight + hour * 3600)
+	monkeypatch.setattr(browser_login, 'browser_visit', visit)
+	account = store.create(name='calendar', base_url='https://x.test', mechanism='login_bonus', checkin_after='09:10')
+	outcome = await service._browser_visit(account, newapi.SiteInfo(base_url=account.base_url))
+	assert outcome.success is expected
+	assert outcome.checked_in is False
+
+
+async def test_browser_fallback_preserves_new_body_token_and_persists_it(service, store, stub, browser, monkeypatch):
+	from types import SimpleNamespace
+	import panel.browser_login as browser_login
+
+	calls, box = stub
+	box['site'] = newapi.SiteInfo(base_url='https://x.test', checkin_path='/api/user/checkin')
+	async def login(**_):
+		return SimpleNamespace(credential='', user={'id': 4242}, access_token='Bearer new-body-token')
+	async def check_in(login, site=None):
+		calls.append(login)
+		if len(calls) == 1:
+			return newapi.Outcome(False, error='凭据无效')
+		return newapi.Outcome(bool(login.access_token), access_token=login.access_token)
+	monkeypatch.setattr(browser_login, 'browser_login', login)
+	monkeypatch.setattr(newapi, 'check_in', check_in)
+	account = store.create(name='body-only', base_url='https://x.test', login_method='github', access_token='expired')
+	outcome = await service.check_in(account.id)
+	assert calls[1].access_token == 'Bearer new-body-token'
+	assert outcome.success
+	assert store.get(account.id).access_token == 'Bearer new-body-token'
+
+
+async def test_successful_http_token_rotation_is_persisted(service, store, stub):
+	_, box = stub
+	box['outcome'] = newapi.Outcome(True, access_token='Bearer rotated-body-token')
+	account = store.create(name='persist', base_url='https://x.test', access_token='old')
+	await service.check_in(account.id)
+	assert store.get(account.id).access_token == 'Bearer rotated-body-token'
+
+
+@pytest.mark.parametrize('paste', [None, 'bare-refresh-value'])
+async def test_refresh_fork_verifies_unlabelled_cookie_as_refresh(service, store, stub, auth, paste):
+	_, box = stub
+	box['site'] = newapi.SiteInfo(base_url='https://x.test', refresh_path=newapi.REFRESH_PATH)
+	_, seen = auth
+	account = store.create(name='bare', base_url='https://x.test', login_method='session', session='bare-refresh-value')
+	candidates = newapi.credentials_from_paste(paste) if paste else None
+	check = await service.verify_credential(account.id, candidates)
+	assert check.ok and check.kind == newapi.REFRESH_COOKIE
+	assert seen['spent'] == 'bare-refresh-value'
+	assert seen['access_token'] == 'Bearer token-1'
+	assert store.get(account.id).session == 'rotated-cookie'
+
+
+@pytest.mark.parametrize('backend,path', [('vyce', '/user/daily-reward'), ('sub2api', '/api/v1/check-in/status')])
+async def test_native_adapters_never_use_newapi_reconciliation(service, store, monkeypatch, backend, path):
+	from types import SimpleNamespace
+	account = store.create(name=backend, base_url='https://x.test', session='native-session')
+	async def forbidden(*args, **kwargs):
+		raise AssertionError('New API status and quota log cannot interpret native adapter receipts')
+	monkeypatch.setattr(newapi, 'checkin_status', forbidden)
+	monkeypatch.setattr(newapi, 'last_checkin_at', forbidden)
+	outcome = newapi.Outcome(True, checked_in=False)
+	await service._reconcile(account, outcome, time.time(), newapi.SiteInfo(base_url=account.base_url, backend=backend, status_path=path))
+	assert outcome.success and outcome.checked_in is False
+
+
+async def test_body_token_login_bonus_reads_balance_without_second_refresh(service, store, monkeypatch):
+	from types import SimpleNamespace
+	import panel.browser_login as browser_login
+	async def login(**_):
+		return SimpleNamespace(credential='new-refresh', user={'id': 42}, access_token='Bearer current')
+	seen = []
+	async def balance(*_, **kwargs):
+		seen.append(kwargs)
+		return 3.0 if kwargs.get('access_token') == 'Bearer current' else 1.0
+	async def no_refresh(*_):
+		raise AssertionError('already have the token won by this browser hop')
+	monkeypatch.setattr(browser_login, 'browser_login', login)
+	monkeypatch.setattr(newapi, 'balance', balance)
+	monkeypatch.setattr(newapi, 'refresh_access', no_refresh)
+	account = store.create(name='bonus', base_url='https://x.test', login_method='github')
+	outcome = await service._browser_check_in(account, newapi.SiteInfo(base_url=account.base_url, refresh_path=newapi.REFRESH_PATH))
+	assert outcome.success and outcome.after_quota == 3.0
+	assert outcome.access_token == 'Bearer current'
+	assert seen[-1]['access_token'] == 'Bearer current'
+
+
+async def test_visit_renewal_accepts_body_only_token(service, store, monkeypatch):
+	from types import SimpleNamespace
+	import panel.browser_login as browser_login
+	async def login(**_):
+		return SimpleNamespace(credential='', user={'id': 42}, access_token='Bearer current')
+	monkeypatch.setattr(browser_login, 'browser_login', login)
+	account = store.create(name='renew', base_url='https://x.test', login_method='github', session='old')
+	assert await service._renew_visit_session(account)
+	assert store.get(account.id).access_token == 'Bearer current'
+	assert not store.get(account.id).session
+
+
+async def test_manual_idp_verification_saves_body_token(service, store, monkeypatch):
+	from types import SimpleNamespace
+	import panel.browser_login as browser_login
+	async def inject(*args, **kwargs):
+		return SimpleNamespace(credential='', api_user=42, access_token='Bearer current')
+	monkeypatch.setattr(browser_login, 'inject_idp_cookies', inject)
+	account = store.create(name='manual', base_url='https://x.test', login_method='github', session='old')
+	await service.inject_idp_cookies(account.id, '[]')
+	assert store.get(account.id).access_token == 'Bearer current'
+	assert not store.get(account.id).session
+
+
 # --- deleting an account, and the profile that outlived it ----------------------------------
 
 

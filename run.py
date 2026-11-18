@@ -9,9 +9,10 @@ scheduler keeps them going while the panel is open. No GitHub Actions, no secret
 
 Env vars (read at startup):
   PANEL_PORT        — port to listen on (default 8000)
-  PANEL_HOST        — bind address (default 0.0.0.0, LAN-reachable; 127.0.0.1 = local-only).
-                      There is no auth layer and /api/accounts returns credentials in the
-                      clear (ADR-0003), so this is the trust boundary.
+  PANEL_HOST        — bind address (default 127.0.0.1, local-only). Remote access requires
+                      an authenticated reverse proxy or private network.
+  PANEL_ALLOWED_ORIGINS — comma-separated exact public origins for a reverse proxy
+                      (e.g. https://panel.example); forwarded Host headers are not trusted.
   PANEL_SCHEDULER   — "0" to disable the daily auto check-in loop
   CHECKIN_PROXY_URL — proxy for the browser login (default http://127.0.0.1:7897)
 
@@ -49,7 +50,7 @@ def main():
 	)
 
 	port = int(os.getenv('PANEL_PORT', '8000'))
-	host = os.getenv('PANEL_HOST', '0.0.0.0')
+	host = os.getenv('PANEL_HOST', '127.0.0.1')
 	print(f'[PANEL] Starting on http://{host}:{port}')
 	print(f'[PANEL] DB: {_SANDBOX.db_path}')
 	print(f'[PANEL] Scheduler: {"on (every 30 min)" if scheduler_on else "off"}')

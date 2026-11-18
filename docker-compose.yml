@@ -25,19 +25,22 @@ services:
 
     # 只绑回环地址。
     #
-    # 面板**没有登录功能**，`GET /api/accounts` 会明文返回每个账号的密码和 session
-    # （上游 ADR-0003 的设计取舍：单用户、跑在自己机器上）。所以：
+    # 面板**没有登录功能**。账号 API 已脱敏，但调用方仍能修改账号、触发操作。
+    # 账号数据库仍含明文凭据，因此：
     #   自己电脑上用   → 就这样，别改。浏览器打开 http://127.0.0.1:8000
     #   想从手机访问   → 用 Tailscale / WireGuard 之类的私有网络
     #   必须放公网     → 认证 + TLS + 面板端口不对外，三者缺一不可
     #                    做法见 docs/deploying.md
-    # 直接把这里的 127.0.0.1 换成 0.0.0.0 会把所有账号凭据交给网络上任何人。
+    # 不要直接改成 0.0.0.0 向公网开放；Host/Origin 校验不替代身份认证。
     ports:
       - "127.0.0.1:${PANEL_PORT:-8000}:8000"
 
     environment:
       # 站点按本地时间开当天奖励（checkin_after），时区必须对。
       TZ: ${TZ:-Asia/Shanghai}
+
+      # 远程反代/VPN 浏览器访问的精确 origin，不带路径；仍须配置身份认证。
+      PANEL_ALLOWED_ORIGINS: ${PANEL_ALLOWED_ORIGINS:-}
 
       # 每日自动签到循环（窗口到了自动签，失败退避重试）。设 "0" 只保留手动。
       PANEL_SCHEDULER: "1"
