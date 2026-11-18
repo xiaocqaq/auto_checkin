@@ -140,7 +140,7 @@ def test_a_site_the_owner_already_has_hides_its_card():
 
 
 def test_hosts_and_age_come_from_the_accounts_themselves():
-	accounts = [account('https://WWW.Seekai.cc/'), account('https://api.x.test/console')]
+	accounts = [account('https://WWW.Relay10/'), account('https://api.x.test/console')]
 
 	assert promo.hosts_of(accounts) == {'relay10', 'api.x.test'}
 	assert promo.panel_age_h([], now=NOW) == 0.0, 'nobody with no accounts has been using the panel'

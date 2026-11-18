@@ -75,7 +75,7 @@ export default function IdpCookiesModal({ account, isOpen, onClose, onInjected }
           <ol className="list-decimal space-y-1 pl-4 text-xs text-default-500">
             <li>在你自己电脑的浏览器里登录 {provider}</li>
             <li>
-              用 cookie 扩展（如 Cookie-Editor），<b>停在 {host || provider} 这个页面上</b>点导出 / Export
+              用 cookie 导出工具（如 Cookie-Editor），<b>停在 {host || provider} 这个页面上</b>点导出 / Export
               —— 不是签到站点的页面
             </li>
             <li>整段 JSON 粘到下面</li>
@@ -88,7 +88,7 @@ export default function IdpCookiesModal({ account, isOpen, onClose, onInjected }
             minRows={6}
             maxRows={14}
             placeholder='[{"domain": ".linux.do", "name": "_t", "value": "...", ...}, ...]'
-            description="整段粘进来就行，面板自己挑出要用的那几条"
+            description="请仅粘贴对应登录平台导出的 Cookie JSON，不要包含其他网站会话"
             classNames={{ ...FIELD, input: 'font-mono text-xs' }}
           />
           <div className="flex items-start justify-between gap-3 rounded-medium bg-default-100 px-3 py-2">

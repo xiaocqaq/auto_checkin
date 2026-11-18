@@ -23,6 +23,7 @@ from pydantic import BaseModel
 from panel import newapi, promo, scheduler
 from panel.service import CheckInService, CredentialCheck
 from panel.store import LOGIN_METHODS, MECHANISMS, AccountStore
+from panel.vendor.utils.browser import ProfileBusyError
 
 
 class AccountIn(BaseModel):
@@ -150,9 +151,12 @@ def create_app(
 	@asynccontextmanager
 	async def lifespan(_app: FastAPI):
 		task = asyncio.create_task(scheduler.loop(store, service)) if enable_scheduler else None
-		yield
-		if task:
-			task.cancel()
+		try:
+			yield
+		finally:
+			if task:
+				task.cancel()
+				await asyncio.gather(task, return_exceptions=True)
 
 	app = FastAPI(title='Check-in Panel', lifespan=lifespan)
 
@@ -312,7 +316,7 @@ def create_app(
 				headless=payload.headless,
 			)
 		except Exception as e:
-			raise HTTPException(status_code=400, detail=newapi.why(e)) from e
+			raise HTTPException(status_code=409 if isinstance(e, ProfileBusyError) else 400, detail=newapi.why(e)) from e
 		store.update(account_id, session=result.credential, api_user=result.user.get('id'))
 		# The credential just changed, so the stored result describes a run made with the old
 		# one — leaving it makes the list show 「refresh 凭据已失效」 beside an account that has
@@ -351,7 +355,7 @@ def create_app(
 		except ValueError as e:  # not a cookie jar, or the wrong provider — nothing was touched
 			raise HTTPException(status_code=422, detail=str(e)) from None
 		except Exception as e:
-			raise HTTPException(status_code=400, detail=newapi.why(e)) from e
+			raise HTTPException(status_code=409 if isinstance(e, ProfileBusyError) else 400, detail=newapi.why(e)) from e
 		# The site session the verification won is already stored; it must not travel back.
 		# This API never hands a credential to the browser, and the caller has no use for it.
 		return {k: v for k, v in asdict(result).items() if k != 'credential'}

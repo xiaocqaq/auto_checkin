@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from panel import newapi, scheduler
-from panel.service import CheckInService, window_start
+from panel.service import CheckInService, attempt_gate, window_start
 from panel.store import Account, AccountStore
 
 
@@ -471,6 +471,29 @@ async def test_the_visit_mechanism_needs_no_receipt(service, store, stub, monkey
 	assert visited == ['https://x.test']
 
 
+async def test_open_only_visit_opens_the_existing_profile_without_oauth_renewal(service, store, stub, monkeypatch):
+	monkeypatch.setenv('CHECKIN_OPEN_ONLY_HOSTS', 'relay16.example')
+	import panel.browser_login as browser_login
+
+	visits = []
+	async def visit(**kw):
+		visits.append(kw)
+		user = {'id': 23, 'quota': 87_500_000}
+		return browser_login.BrowserVisit(before=user, after=user, session='sess', checkin_at=time.time())
+
+	monkeypatch.setattr(browser_login, 'browser_visit', visit)
+	async def no_renewal(*_):
+		raise AssertionError('open-only mode must not renew through OAuth')
+	monkeypatch.setattr(service, '_renew_visit_session', no_renewal)
+	account = store.create(name='open_only', base_url='https://relay16.example', login_method='github', mechanism='visit', session='saved-session')
+
+	outcome = await service.check_in(account.id)
+
+	assert outcome.success is True
+	assert visits and visits[0]['open_only'] is True
+	assert visits[0]['stored_session'] == 'saved-session'
+
+
 async def test_a_declared_visit_still_posts_a_route_the_probe_can_see(service, store, stub, monkeypatch):
 	"""`visit` declares what probing cannot see — so a route it *can* see outranks it.
 
@@ -541,7 +564,7 @@ async def test_a_visit_cannot_claim_today_is_done_when_the_bonus_beat_the_measur
 
 	monkeypatch.setattr(browser_login, 'browser_visit', visit)
 	account = store.create(
-		name='any-20220402125', base_url='https://relay8', username='u', password='p',
+		name='visit-account', base_url='https://relay8', username='u', password='p',
 		mechanism='visit', checkin_after='08:30',
 	)
 
@@ -743,17 +766,18 @@ def test_scheduler_due_needs_credentials_and_a_url():
 def test_scheduler_due_is_once_per_window_and_backs_off_on_failure():
 	yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
 	now = datetime.now(timezone.utc)
+
 	done = dict(session='s', last_success=True, last_run_at=now.isoformat())
 
 	assert scheduler.due(_account(**done)) is False, 'collected already: leave it alone'
-	assert scheduler.due(_account(**{**done, 'last_run_at': yesterday})) is True, 'a new window'
+	assert scheduler.due(_account(**{**done, 'last_run_at': yesterday})) is True, 'a new day'
 	assert scheduler.due(_account(session='s', last_success=True, last_run_at='not-a-date')) is True
 
-	# A failure is retried, but not on every tick: 30min, then 1h, 2h, 4h. The window has
-	# to be an old one for that to matter — a fresh window always gets its attempt — so
-	# pin it to a minute from now, which puts its opening a whole day back.
-	soon = (datetime.now().astimezone() + timedelta(minutes=1)).strftime('%H:%M')
-	failing = dict(session='s', last_success=False, checkin_after=soon)
+	# A failure is retried, but not on every tick: 30min, then 1h, 2h, 4h.
+	# 本机: 闸门用「今天 checkin_after 那个时刻」且不回滚，所以把 checkin_after 设成
+	# 一分钟前（已过闸门），退避才真正起作用。
+	past = (datetime.now().astimezone() - timedelta(minutes=1)).strftime('%H:%M')
+	failing = dict(session='s', last_success=False, checkin_after=past)
 
 	assert scheduler.due(_account(**failing, failures=1, last_run_at=now.isoformat())) is False
 	assert scheduler.due(
@@ -765,26 +789,48 @@ def test_scheduler_due_is_once_per_window_and_backs_off_on_failure():
 	assert scheduler.backoff_s(9) == scheduler.MAX_BACKOFF_S, 'and it stops widening at the cap'
 
 
-def test_a_site_whose_day_starts_at_0830_is_not_due_all_night():
-	"""relay8 opens its bonus at 08:30, so the day's boundary is 08:30 — a run that
-	succeeded at 09:00 is still the current window at 02:00, and the account must not
-	churn all night."""
+def test_a_site_whose_day_starts_at_0830_does_not_churn_all_night():
+	"""relay8 opens its bonus at 08:30 —— 这是「什么时候可以动手」，不是「哪一天」。
+
+	本机 语义（实测 relay18 后修正）：
+	  * 凌晨 02:00 不许动手（用户设的 08:30 必须挡住），但
+	  * 昨天 09:00 的成功记录仍算「昨天」，所以今天 09:00 前它是待签，不是「今天已签」。
+	上游把两者混成一个回滚窗口，结果面板每天凌晨抢跑、抢完又判「今天没记录」整天报失败。
+	"""
 	noon = datetime.now().astimezone().replace(hour=12, minute=0, second=0, microsecond=0)
 	late = _account(session='s', checkin_after='08:30')
-	early = _account(session='s', checkin_after='08:30')
 
+	# 窗口语义本身保留给兼容：08:30 之前算「昨天的窗口」。
 	assert window_start(late, noon) == noon.replace(hour=8, minute=30).timestamp()
 	assert window_start(late, noon.replace(hour=2)) == (
 		noon.replace(hour=8, minute=30) - timedelta(days=1)
-	).timestamp(), 'before it opens, the current window is yesterday morning'
+	).timestamp(), 'before it opens, the upstream window is yesterday morning'
 	assert window_start(_account(session='s'), noon) == noon.replace(hour=0).timestamp(), 'default is midnight'
 	assert window_start(_account(session='s', checkin_after='nonsense'), noon) == noon.replace(hour=0).timestamp()
 
-	opened = window_start(late)
-	inside = datetime.fromtimestamp(opened + 60).astimezone().isoformat()
-	before = datetime.fromtimestamp(opened - 60).astimezone().isoformat()
-	assert scheduler.due(_account(session='s', checkin_after='08:30', last_success=True, last_run_at=inside)) is False
-	assert scheduler.due(_account(session='s', checkin_after='08:30', last_success=True, last_run_at=before)) is True
+	# 闸门：今天 08:30 之前一律不动手（这就是用户设置生效的地方）。
+	assert attempt_gate(late, noon) == noon.replace(hour=8, minute=30).timestamp()
+	assert attempt_gate(_account(session='s'), noon) == noon.replace(hour=0).timestamp()
+
+	two_am = noon.replace(hour=2, minute=0)
+	yesterday_ok = (noon - timedelta(days=1)).replace(hour=9, minute=0).isoformat()
+	assert scheduler.due(
+		_account(session='s', checkin_after='08:30', last_success=True, last_run_at=yesterday_ok),
+		two_am,
+	) is False, '凌晨还没到启动时刻，不许抢跑'
+
+	# 昨天成功过、今天过了闸门：待签。
+	assert scheduler.due(
+		_account(session='s', checkin_after='08:30', last_success=True, last_run_at=yesterday_ok),
+		noon,
+	) is True
+
+	# 今天 0 点后成功过：收工。
+	today_ok = noon.replace(hour=9, minute=0).isoformat()
+	assert scheduler.due(
+		_account(session='s', checkin_after='08:30', last_success=True, last_run_at=today_ok),
+		noon,
+	) is False
 
 
 @pytest.fixture
@@ -1255,3 +1301,61 @@ async def test_a_renewal_is_only_attempted_when_the_card_is_actually_gone(servic
 
 	assert (outcome.success, outcome.checked_in) == (True, True), 'the balance moved: the bonus landed'
 	assert logins == [], 'no OAuth round trip on a day the card still works'
+
+
+@pytest.mark.parametrize('receipt,success,checked', [
+	('earlier_today', True, False),
+	('during_run', True, True),
+	('yesterday', False, False),
+	('unconfirmed', False, None),
+])
+async def test_open_only_completion_requires_today_allowance_receipt(service, store, monkeypatch, receipt, success, checked):
+	monkeypatch.setenv('CHECKIN_OPEN_ONLY_HOSTS', 'relay16.example')
+	from panel import browser_login
+	from panel import service as service_module
+	now = datetime.now().astimezone().replace(hour=12, minute=0, second=0, microsecond=0).timestamp()
+	monkeypatch.setattr(service_module.time, 'time', lambda: now)
+	stamp = {'earlier_today': now - 3600, 'during_run': now, 'yesterday': now - 86400, 'unconfirmed': None}[receipt]
+	user = {'id': 23, 'username': 'alice', 'quota': 52_500_000}
+	async def visit(**kw):
+		assert kw['open_only'] is True
+		return browser_login.BrowserVisit(before=user, after=user, session='rotated-refresh', checkin_at=stamp)
+	async def forbidden(*_, **__):
+		raise AssertionError('open_only type-1 allowance must not use OAuth or generic type-4/status reconciliation')
+	site = newapi.SiteInfo(base_url='https://relay16.example', status_path='/api/user/checkin')
+	async def attempt(account):
+		return await service._browser_visit(account, site, open_only=True), site
+	monkeypatch.setattr(browser_login, 'browser_visit', visit)
+	monkeypatch.setattr(service, '_attempt', attempt)
+	monkeypatch.setattr(service, '_renew_visit_session', forbidden)
+	monkeypatch.setattr(newapi, 'last_checkin_at', forbidden)
+	monkeypatch.setattr(newapi, 'checkin_status', forbidden)
+	account = store.create(name='open_only-proof', base_url='https://relay16.example', login_method='github', mechanism='visit')
+	outcome = await service.check_in(account.id)
+	assert (outcome.success, outcome.checked_in) == (success, checked)
+	assert outcome.awarded is None, 'an existing daily receipt is not money won by this run'
+	assert bool(outcome.error) is not success
+	saved = store.get(account.id)
+	assert saved.session == 'rotated-refresh', 'save the rotated credential even when the allowance is unconfirmed'
+	assert saved.last_success == success and saved.last_checked_in == checked
+	assert saved.last_quota == pytest.approx(105.0)
+
+
+@pytest.mark.parametrize('configured,base_url,expected', [
+	(None, 'https://relay16.example', False),
+	('', 'https://relay16.example', False),
+	(' , , ', 'https://relay16.example', False),
+	('relay16.example', 'https://relay16.example/console', True),
+	(' relay17.example, RELAY16.EXAMPLE. , ', 'https://ReLaY16.Example.:443', True),
+	('relay16.example', 'https://sub.relay16.example', False),
+	('relay16.example', 'https://relay16.example.attacker.test', False),
+	('relay16.example', 'https://relay16.example@attacker.test', False),
+	('https://relay16.example', 'https://relay16.example', False),
+])
+def test_open_only_hosts_require_explicit_exact_hostname(monkeypatch, configured, base_url, expected):
+	from panel.service import _open_only_visit
+	if configured is None:
+		monkeypatch.delenv('CHECKIN_OPEN_ONLY_HOSTS', raising=False)
+	else:
+		monkeypatch.setenv('CHECKIN_OPEN_ONLY_HOSTS', configured)
+	assert _open_only_visit(Account(id=1, name='A', base_url=base_url)) is expected

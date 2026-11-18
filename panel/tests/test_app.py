@@ -519,6 +519,35 @@ def test_a_paste_that_is_not_a_cookie_jar_is_422_and_touches_no_profile(client, 
 	assert response.status_code == 422 and 'JSON' in response.json()['detail']
 
 
+@pytest.mark.parametrize('route', ['browser-login', 'idp-cookies'])
+def test_profile_busy_returns_conflict(client, store, service, monkeypatch, route):
+	import json
+	import panel.browser_login as module
+	from panel.vendor.utils.browser import ProfileBusyError
+	account = store.create(name='A', base_url='https://x.test', login_method='github')
+	raise_busy = AsyncMock(side_effect=ProfileBusyError('浏览器配置正在使用，请稍后重试'))
+	monkeypatch.setattr(module, 'browser_login', raise_busy)
+	service.inject_idp_cookies = raise_busy
+	payload = {'cookies': json.dumps([{'name': 'user_session', 'value': 'test', 'domain': '.github.com'}])}
+	if route == 'browser-login':
+		payload = {}
+	response = client.post(f'/api/accounts/{account.id}/{route}', json=payload)
+	assert response.status_code == 409
+	assert '正在使用' in response.json()['detail']
+
+
+@pytest.mark.parametrize('method,path', [
+	('post', '/idp-transfer'),
+	('post', '/idp-transfer/complete'),
+	('get', '/idp-transfer/jobs/removed-ticket'),
+])
+def test_extension_transfer_endpoints_are_removed(client, store, service, method, path):
+	account = store.create(name='GitHub', base_url='https://x.test', login_method='github')
+	response = getattr(client, method)(f'/api/accounts/{account.id}{path}')
+	assert response.status_code == 404
+	service.inject_idp_cookies.assert_not_called()
+
+
 def test_injecting_into_a_password_account_is_refused_with_the_reason(client, store, service):
 	"""A password or session account has no IdP profile to feed — pasting the site's own
 	cookie is the whole job there, and saying so beats a generic failure."""

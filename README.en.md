@@ -211,7 +211,7 @@ all — how you originally logged in does not matter on this path.
 Sites issue two kinds. Use the first if you can.
 
 **Preferred: an access token.** Most New API sites have "访问令牌 / Access Token" on the profile
-page (measured here on `api.hcnsec.cn`: `/profile` → 访问令牌 → 生成). It is a plain string you
+page (measured here on `relay1.example`: `/profile` → 访问令牌 → 生成). It is a plain string you
 copy from the site's own UI, it needs **no browser extension**, and it does not expire in a month
 the way a cookie does. Pick **Access Token** as the **登录方式** (Login method) and paste it —
 the panel sends it as the `Authorization` header, which the site's `/api/user/self` and its
@@ -221,7 +221,7 @@ check-in route both accept.
 
 1. Open **the check-in site itself** in your own browser and log in.
 2. Take the **value** of the `session` cookie. It is usually **HttpOnly** (measured on
-   `api.hcnsec.cn`: `HttpOnly; SameSite=Strict; Max-Age=2592000`), so page JS cannot read it;
+   `relay1.example`: `HttpOnly; SameSite=Strict; Max-Age=2592000`), so page JS cannot read it;
    the reliable route is the browser's own **DevTools → Application → Cookies → the site →
    `session` → copy Value**. A cookie extension can read HttpOnly too, but check that it has
    permission on that site and that you are standing **on the site's own page** — standing on
@@ -249,7 +249,7 @@ localStorage is the same number).
 Two limits, which the UI also states:
 
 - **The panel cannot renew a session cookie.** When it expires you paste again (measured: 30 days
-  on `api.hcnsec.cn`). An access token does not have this problem, an account with a password
+  on `relay1.example`). An access token does not have this problem, an account with a password
   re-logs in by itself, and an OAuth-only account should use Option B, which lasts weeks to
   months per paste.
 - **It only covers `endpoint` sites.** `login_bonus` grants the bonus by logging in again (the
@@ -257,7 +257,7 @@ Two limits, which the UI also states:
   (relay8). Neither is something a cookie or a token can stand in for.
 
 Worth saying: if the site still offers password login and does not gate it behind Turnstile
-(`api.hcnsec.cn` is exactly this), you do not need to paste anything — fill in the username and
+(`relay1.example` is exactly this), you do not need to paste anything — fill in the username and
 password, and the panel runs the whole thing over plain HTTP with a credential that never
 expires. Try that first.
 

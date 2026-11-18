@@ -296,7 +296,7 @@ async def checkin_status(
 	return CheckinStatus(
 		today=today if isinstance(today, bool) else None,
 		awarded_today=_usd_raw(awarded, quota_per_unit),
-		# `reward_credits` is already a display amount (sotamodel shows it as `$100`), not
+		# `reward_credits` is already a display amount (relay11 shows it as `$100`), not
 		# raw quota units — dividing it by quota_per_unit would report $0.0002.
 		reward=float(data['reward_credits']) if isinstance(data.get('reward_credits'), (int, float)) else None,
 		total=total if isinstance(total, int) else None,
@@ -617,6 +617,14 @@ async def _password_login(client: httpx.AsyncClient, login: Login) -> tuple[Opti
 		# Some forks validate `new-api-user` against the session and 401 every
 		# authenticated route without it — the SPA sends it, so we send it too.
 		client.headers['new-api-user'] = str(data['id'])
+	# 本机部署：有些 New API 分支（relay17.example 实测，2026-10-24）是纯 JWT 认证——
+	# 登录把凭证放在**响应体**的 `access_token` 里，而它的 cookie（`new_api_refresh` /
+	# `new_api_has_session`）不参与认证：不带 `Authorization` 头时 `POST /api/user/checkin`
+	# 恒定 401 `Unauthorized, invalid access token`。旧代码只吸收了 `id`，把 token 丢掉，
+	# 于是每次签到都裸奔 401（面板显示「签到失败」）。带上它立刻 200。
+	token = data.get('access_token')
+	if token:
+		client.headers['Authorization'] = token
 	return data, None
 
 
@@ -715,11 +723,16 @@ async def _check_in_endpoint(login: Login, site: SiteInfo) -> Outcome:
 		proxy=_turnstile_proxy() if login.turnstile else None,
 	) as client:
 		adopted = login.api_user
+		won_token = login.access_token
 		if not (login.session or login.access_token):
 			data, error = await _password_login(client, login)
 			if error:
 				return Outcome(False, error=f'登录失败: {error}')
 			adopted = data.get('id') or adopted
+			# 本机部署：`_password_login` 把响应体里的 JWT 装进 client.headers。要把它带出去
+			# （Outcome.access_token），否则 `_reconcile` 读「今天有没有签到记录」时又退回
+			# 无 token 状态、恒定 401，于是明明签到了也报「今天没有签到记录」——relay17.example 实测。
+			won_token = client.headers.get('Authorization') or won_token
 		before, error = await _self(client)
 		if before is None and login.username and login.password:
 			# The stored credential did not authenticate — a dead session, or a fork that
@@ -730,6 +743,7 @@ async def _check_in_endpoint(login: Login, site: SiteInfo) -> Outcome:
 			if error:
 				return Outcome(False, error=f'登录失败: {error}', session=login.session)
 			adopted = data.get('id') or adopted
+			won_token = client.headers.get('Authorization') or won_token
 			before, error = await _self(client)
 		if before is None and not login.password:
 			# Carry the credential out even in failure: a JWT fork rotated its refresh cookie
@@ -761,7 +775,7 @@ async def _check_in_endpoint(login: Login, site: SiteInfo) -> Outcome:
 			before_quota=usd(before, site.quota_per_unit),
 			after_quota=after_quota if after_quota is not None else usd(after, site.quota_per_unit),
 			session=_cookie_of(client) or login.session,
-			access_token=login.access_token,
+			access_token=won_token,
 			api_user=adopted,
 			awarded=_usd_raw(granted.get('quota_awarded'), site.quota_per_unit),
 		)

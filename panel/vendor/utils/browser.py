@@ -52,12 +52,14 @@ def stealth_args_for(profile_dir) -> list[str]:
 
 
 def _pid_alive_in_this_container(pid: str) -> bool:
-	"""True if `pid` is a live chrome process we can see in our own PID namespace."""
+	"""Conservatively retain a lock unless its owner is confirmed absent."""
 	try:
 		raw = Path(f'/proc/{int(pid)}/cmdline').read_bytes()
-	except (FileNotFoundError, PermissionError, ValueError):
+	except FileNotFoundError:
 		return False
-	return b'chrome' in raw
+	except (OSError, ValueError):
+		return True  # unreadable/unknown is not proof that an owner exited
+	return bool(raw)  # even a reused non-Chromium PID cannot be safely declared dead
 
 
 def release_stale_profile_lock(profile_dir) -> list[str]:
@@ -90,7 +92,7 @@ def release_stale_profile_lock(profile_dir) -> list[str]:
 	if holder != socket.gethostname():
 		# 别的容器/机器写的锁，本进程没资格判断它死没死，别动。
 		return []
-	if pid.isdigit() and _pid_alive_in_this_container(pid):
+	if not pid.isdigit() or _pid_alive_in_this_container(pid):
 		return []
 	removed = []
 	for name in ('SingletonLock', 'SingletonSocket', 'SingletonCookie'):
@@ -272,6 +274,73 @@ def _ensure_binary_path(settings: BrowserLoginSettings) -> None:
 		os.environ['CLOAKBROWSER_BINARY_PATH'] = settings.cloakbrowser_binary_path
 
 
+class ProfileBusyError(RuntimeError):
+	"""A profile is owned by another login, import, or check-in."""
+
+
+_PROFILE_BUSY = '该账号的浏览器配置正在被登录、导入或签到使用，请等待当前操作结束后重试（不会清除 GitHub 会话）'
+
+
+def _acquire_profile_lease(profile_dir, *, kind='browser'):
+	"""Keep the stable lock inode outside the profile (forget_profile may delete it)."""
+	import errno
+	import hashlib
+	try:
+		import fcntl
+	except ImportError:  # Windows has byte-range locks instead of flock.
+		fcntl = None
+		import msvcrt
+
+	profile = Path(profile_dir).resolve()
+	locks = profile.parent / '.profile-locks'
+	locks.mkdir(parents=True, exist_ok=True)
+	key = hashlib.sha256(str(profile).encode('utf-8')).hexdigest()
+	lease = (locks / f'{key}.{kind}.lock').open('a+b')
+	try:
+		if fcntl is not None:
+			fcntl.flock(lease.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+		else:
+			# Windows permits locking beyond EOF; every holder locks the same first byte.
+			# Closing the handle releases the lock on both platforms.
+			lease.seek(0)
+			msvcrt.locking(lease.fileno(), msvcrt.LK_NBLCK, 1)
+	except OSError as exc:
+		lease.close()
+		if exc.errno in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+			raise ProfileBusyError(_PROFILE_BUSY) from None
+		raise
+	except BaseException:
+		lease.close()
+		raise
+	return lease
+
+
+class _PersistentBrowserContext:
+	def __init__(self, context: BrowserContext, lease) -> None:
+		self._context = context
+		self._lease = lease
+		self._close_task = None
+
+	def __getattr__(self, name: str):
+		return getattr(self._context, name)
+
+	async def _close(self, *args, **kwargs) -> None:
+		try:
+			await self._context.close(*args, **kwargs)
+		except BaseException:
+			print('[WARN] 浏览器关闭失败；仍存在的 Singleton 锁将继续阻止重复启动')
+			raise
+		finally:
+			self._lease.close()
+
+	async def close(self, *args, **kwargs) -> None:
+		# Keep the lease until close finishes; a surviving Singleton still blocks relaunch.
+		if self._close_task is None:
+			self._close_task = asyncio.create_task(self._close(*args, **kwargs))
+			self._close_task.add_done_callback(lambda task: task.exception() if not task.cancelled() else None)
+		await asyncio.shield(self._close_task)
+
+
 class _EphemeralBrowserContext:
 	def __init__(self, context: BrowserContext, browser) -> None:
 		self._context = context
@@ -321,11 +390,40 @@ async def launch_login_context(settings: BrowserLoginSettings, *, use_proxy: boo
 	if settings.persist_profile:
 		from cloakbrowser import launch_persistent_context_async
 
-		settings.profile_dir.mkdir(parents=True, exist_ok=True)
-		# 本机部署：启动前先清掉崩溃残留的 Singleton* 锁，否则这个账号会一直
-		# 卡在「profile already in use」，人工删锁才能恢复。见 release_stale_profile_lock。
-		release_stale_profile_lock(settings.profile_dir)
-		return await launch_persistent_context_async(str(settings.profile_dir), **launch_kwargs)
+		lease = _acquire_profile_lease(settings.profile_dir)
+		try:
+			settings.profile_dir.mkdir(parents=True, exist_ok=True)
+			release_stale_profile_lock(settings.profile_dir)
+			# A visible/manual Chromium not started through this helper still owns its profile.
+			lock = settings.profile_dir / 'SingletonLock'
+			if os.path.lexists(lock):
+				raise ProfileBusyError(_PROFILE_BUSY)
+		except BaseException:
+			lease.close()
+			raise
+
+		async def launch_owned():
+			try:
+				context = await launch_persistent_context_async(str(settings.profile_dir), **launch_kwargs)
+			except BaseException:
+				lease.close()
+				raise
+			return _PersistentBrowserContext(context, lease)
+
+		launch_task = asyncio.create_task(launch_owned())
+		try:
+			return await asyncio.shield(launch_task)
+		except asyncio.CancelledError:
+			# Collect a context allocated during launch even if the request went away.
+			async def cleanup():
+				try:
+					context = await launch_task
+					await context.close()
+				except BaseException:
+					print('[WARN] 已取消请求的浏览器启动清理失败，请检查 Singleton owner')
+			cleanup_task = asyncio.create_task(cleanup())
+			await asyncio.shield(cleanup_task)
+			raise
 
 	from cloakbrowser import launch_async
 

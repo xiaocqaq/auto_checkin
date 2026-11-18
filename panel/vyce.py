@@ -36,6 +36,7 @@ import time
 from typing import Optional
 
 import httpx
+from urllib.parse import urlparse
 
 from panel.newapi import Login, Outcome, SiteInfo
 
@@ -47,7 +48,8 @@ POW_PATH = '/user/pow'
 LOGIN_PATH = '/user/login'
 BALANCE_PATH = '/user/balance'
 
-TIMEOUT_S = 30.0
+TIMEOUT_S = 90.0  # 实测（2026-10-23）该站经本机 mihomo 出网单请求 9~22 秒，30 秒必然撞超时
+CONNECT_S = 15.0  # 建连给到 15 秒：代理握手偶发慢，8 秒会误判成站点挂了
 POW_DEADLINE_S = 60.0  # 客户端解 PoW 的硬上限；实测最坏 0.9 秒，60 秒是给慢机器留的余量
 UA = (
 	'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
@@ -114,7 +116,7 @@ def _client(base_url: str, session: Optional[str] = None) -> httpx.AsyncClient:
 	}
 	return httpx.AsyncClient(
 		base_url=base_url.rstrip('/'),
-		timeout=httpx.Timeout(TIMEOUT_S, connect=8.0),
+		timeout=httpx.Timeout(TIMEOUT_S, connect=CONNECT_S),
 		headers=headers,
 		cookies={'session': session} if session else None,
 		follow_redirects=True,
@@ -198,9 +200,15 @@ async def _login(client: httpx.AsyncClient, login: Login) -> tuple[Optional[str]
 	if response.status_code != 200 or not body.get('token'):
 		return None, _error_of(response, body)
 
+	# 登录后 jar 里会有两条 `session`：客户端手工种进来的旧会话（domain=''，多半已过期），
+	# 和服务端 Set-Cookie 下发的新会话（domain=站点主机名）。`client.cookies.jar` 不保证顺序，
+	# 取第一条会随机撞上那条过期的空域 cookie —— 实测就是这样把一次成功登录读成 401 的。
+	# 只认服务端按本域下发的新 cookie，取不到就用响应里的 token 兜底（二者同值）。
 	cookie = None
+	host = urlparse(login.base_url).hostname or ''
 	for c in client.cookies.jar:
-		if c.name == 'session':
+		domain = (c.domain or '').lstrip('.')
+		if c.name == 'session' and domain and host and (domain == host or host.endswith('.' + domain)):
 			cookie = c.value
 			break
 	# token 与 cookie 同值；某个环节没写进 jar 时用它兜底，别让一次成功登录白费。
@@ -228,8 +236,15 @@ async def check_in(login: Login, site: Optional[SiteInfo] = None) -> Outcome:
 			session, error = await _login(client, login)
 			if error or not session:
 				return Outcome(False, error=f'登录失败: {error}', session=login.session)
+			# 只保留这次登录确认有效的那一条会话。重登后 jar 里会同时留着客户端手工种的
+			# 过期空域旧 cookie，若一起发出去，服务端取哪条不确定 —— 绑到站点域名再 set，
+			# 正好替换服务端刚下发的本域 cookie，只带新会话。
+			host = urlparse(base_url).hostname or ''
 			client.cookies.clear()
-			client.cookies.set('session', session)
+			if host:
+				client.cookies.set('session', session, domain=host)
+			else:
+				client.cookies.set('session', session)
 			response = await client.get(DAILY_REWARD_PATH)
 		status = _json(response)
 		if response.status_code != 200 or not status:

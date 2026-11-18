@@ -66,7 +66,7 @@ docker compose ps / logs -f / up -d --build / down
 **有头浏览器可见性（VNC）**
 11. `deploy/entrypoint.sh` — 启动 Xvfb/x11vnc/noVNC 再 exec run.py；启动时清 profile 锁
 12. `Dockerfile` — 拷入口脚本、改 `CMD`、修 noVNC 的 `options.add` bug
-13. `docker-compose.yml` — <VNC端口> 端口、`CHECKIN_VNC` 开关、固定子网 172.19
+13. `docker-compose.yml` — <VNC端口> 端口、`CHECKIN_VNC` 开关、部署环境指定的容器子网
 
 **图形验证码识别（2026-10-12 加）**
 14. `panel/captcha.py`（新增）— 视觉识别模块：`vision_enabled()` / `solve_image()` /
@@ -120,10 +120,9 @@ docker compose ps / logs -f / up -d --build / down
 
 ## 关键坑（都实测踩过）
 
-1. **容器网络必须落在 172.17–172.22**
-   宿主 iptables INPUT 链只放行这五段的容器访问各网关 `172.x.0.1:7890/7891`。
-   自选别的子网（试过 172.28）或走 docker0 的 172.17.0.1（跨网桥）→ 容器连不上
-   mihomo → 被墙站点全 `ConnectTimeout`。
+1. **容器网络必须与宿主防火墙规则一致**
+   为实际使用的容器子网放行代理端口，并使用对应网桥可达的代理地址。
+   子网或代理网关配置不匹配时，容器请求可能出现 `ConnectTimeout`。
 
 2. **浏览器二进制下载也要走代理**
    不设 `HTTP_PROXY`：国内直连 cloakbrowser.dev 超时。更要命的是这个下载是**同步
@@ -209,15 +208,11 @@ docker compose ps / logs -f / up -d --build / down
 
 13. **容器 `/dev/shm` 默认只有 64M，Chrome 会崩**（2026-10-12 实测）
     加载较重 SPA 时渲染进程耗尽 `/dev/shm` 直接崩，面板报
-    `Locator.count: Target crashed`。compose 里设 `shm_size: 512m`（宿主 /dev/shm 有 1.9G）。
+    `Locator.count: Target crashed`。compose 里设 `shm_size: 512m`，并根据实际宿主资源调整。
 
-14. **本机内存紧 + earlyoom 会优先杀 chrome**（2026-10-12）
-    本机 3.6G 内存，`/etc/default/earlyoom`（2026-08/09 特意配的，防整机僵死）里
-    `--prefer ^(chrome|chromium|...)` 把 chrome 列为首选击杀对象，阈值 `-m 18,9 -s 25,12`
-    （内存 <18% **且** swap 空闲 <25% 就 SIGTERM）。跑有头 Chrome 时若内存紧张，渲染进程
-    会被 earlyoom 杀掉，表现同样是 `Target crashed`。
-    **不要改 earlyoom**（那是有意的机器级保护）；正确做法是跑浏览器前先腾内存
-    （临时停 neo4j 等无连接的服务 + `drop_caches`），或让浏览器路径尽量少用。
+14. **内存压力与 OOM 保护可能终止浏览器**
+    跑有头 Chrome 时若内存紧张，渲染进程可能被 OOM 保护终止，表现为 `Target crashed`。
+    先检查内存压力和系统日志，减少浏览器并发或增加资源；不要为了浏览器禁用机器级保护。
 
 ## 回滚
 

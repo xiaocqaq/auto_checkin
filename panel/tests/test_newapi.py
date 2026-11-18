@@ -28,6 +28,10 @@ class FakeSite:
 		self.needs_api_user = False  # forks that 401 a session without `new-api-user`
 		self.refresh = refresh  # a JWT fork: this cookie buys a Bearer token, and rotates
 		self.access_token = 'jwt-access'
+		# relay17.example: a JWT fork whose *login response body* carries the Bearer token and
+		# whose cookies authenticate nothing. Measured 2026-10-24 — without `Authorization`
+		# `POST <checkin_path>` answers 401 `Unauthorized, invalid access token`.
+		self.body_token = False
 		self.calls: list[str] = []
 		# A fork that registered the generic route and turned it *off* (relay11):
 		# it must never be the one we POST, even though it answers.
@@ -43,6 +47,8 @@ class FakeSite:
 
 	def _authed(self, request) -> bool:
 		if self.refresh:  # JWT forks accept nothing but the Bearer token
+			return request.headers.get('authorization', '').endswith(self.access_token)
+		if self.body_token:  # relay17.example — the cookie authenticates nothing, only the JWT
 			return request.headers.get('authorization', '').endswith(self.access_token)
 		if self.needs_api_user and not request.headers.get('new-api-user'):
 			return False
@@ -83,9 +89,15 @@ class FakeSite:
 			granted = not self.checked_in and self.checkin_path is None  # login_bonus sites only
 			if granted:
 				self.checked_in, self.quota = True, self.quota + BONUS
+			data = {'id': 7, 'username': self.username, 'checked_in': granted}
+			if self.body_token:
+				# relay17.example: the Bearer token rides in the login *response body*; the
+				# cookies it sets (`new_api_refresh` / `new_api_has_session`) authenticate
+				# nothing. A client that drops this token 401s on every later route.
+				data['access_token'] = self.access_token
 			return httpx.Response(
 				200,
-				json={'success': True, 'data': {'id': 7, 'username': self.username, 'checked_in': granted}},
+				json={'success': True, 'data': data},
 				headers={'set-cookie': 'session=fresh; Path=/'},
 			)
 
@@ -461,6 +473,22 @@ async def test_endpoint_already_checked_in_is_success(site):
 	site.checked_in = True
 	outcome = await newapi.check_in(login(site))
 	assert (outcome.success, outcome.checked_in, outcome.error) == (True, False, None)
+
+
+async def test_a_login_bodys_bearer_token_is_carried_into_the_check_in(site):
+	"""relay17.example (measured 2026-10-24): a pure-JWT fork that hands the Bearer token back
+	in the login *response body* and whose cookies authenticate nothing. Dropping that token
+	made every check-in answer 401 `Unauthorized, invalid access token` — a permanent
+	"签到失败" for a credential that was fine."""
+	site.checkin_path = '/api/user/checkin'
+	site.body_token = True
+
+	outcome = await newapi.check_in(login(site))
+
+	assert (outcome.success, outcome.checked_in, outcome.error) == (True, True, None)
+	assert outcome.access_token == site.access_token, 'the won token rides out for the read-back'
+	# and the site only ever granted it over an authenticated request
+	assert 'POST /api/user/checkin' in site.calls
 
 
 async def test_login_bonus_reports_checked_in_and_new_session(site):

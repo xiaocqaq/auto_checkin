@@ -24,6 +24,19 @@ from panel.store import Account, AccountStore
 
 CONCURRENCY = 4
 BROWSER_METHODS = ('linuxdo', 'github')  # keep in sync with browser_login.PROVIDER_BUTTONS
+
+
+def _open_only_visit(account: Account) -> bool:
+	"""Opt in by exact hostname; an empty configuration enables no special adapters."""
+	from urllib.parse import urlsplit
+	hosts = {
+		host.strip().lower().rstrip('.')
+		for host in os.getenv('CHECKIN_OPEN_ONLY_HOSTS', '').split(',')
+		if host.strip()
+	}
+	return (urlsplit(account.base_url).hostname or '').lower().rstrip('.') in hosts
+
+
 # Directories Chrome creates *inside* a profile. Their presence is what says a directory is
 # a profile rather than a provider holding profiles — the only way to tell an old-layout
 # leftover from a provider directory, since both are just a name under the root.
@@ -125,16 +138,48 @@ def window_start(account: Account, now: Optional[datetime] = None) -> float:
 	08:30, so a run at 08:00 belongs to *yesterday's* window and an account that already
 	collected yesterday must not look due all night. `checkin_after` is 'HH:MM' local;
 	empty means midnight.
+
+	本机: 这里保留上游的「回滚到昨天」语义只作兼容（测试覆盖它）。实际判定「今天签没签」
+	改用 `_today_start()`，「最早什么时候动手」改用 `attempt_gate()` —— 站点日界在 0 点时，
+	回滚窗口会让面板凌晨就去签，把用户设置的 09:10 变成摆设（实测踩过）。
 	"""
 	now = now or datetime.now().astimezone()
-	hour, minute = 0, 0
-	try:
-		if account.checkin_after:
-			hour, minute = (int(part) for part in account.checkin_after.split(':', 1))
-	except ValueError:  # a hand-typed value that is not HH:MM: treat the day as normal
-		hour, minute = 0, 0
-	start = now.replace(hour=hour % 24, minute=minute % 60, second=0, microsecond=0)
+	hour, minute = _clock(account.checkin_after)
+	start = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
 	return (start if start <= now else start - timedelta(days=1)).timestamp()
+
+
+def _clock(value: Optional[str]) -> tuple[int, int]:
+	"""'HH:MM' -> (hour, minute)；非法值按 0 点处理（手打的值不该让账号直接不可用）。"""
+	try:
+		hour, minute = (int(part) for part in (value or '').split(':', 1))
+	except (ValueError, AttributeError):
+		return 0, 0
+	return hour % 24, minute % 60
+
+
+def _today_start(now: Optional[datetime] = None) -> float:
+	"""本地自然日 0 点的时间戳 —— 只用来回答「这条签到记录算不算今天」。
+
+	和 `window_start` 是两件事：`window_start` 决定「什么时候可以去签」（受 `checkin_after`
+	影响），这里只决定「哪一天」。日界在 0 点、凌晨就发奖励的站点（实测 relay18
+	00:42~03:37 落记录）必须用这个，否则设了 09:10 就把凌晨那条算成昨天的。
+	"""
+	now = now or datetime.now().astimezone()
+	return now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+
+
+def attempt_gate(account: Account, now: Optional[datetime] = None) -> float:
+	"""今天最早可以去签的时间点：`checkin_after` 落在**今天**的那个时刻。
+
+	空 = 今天 0 点。这是用户设定的唯一含义：设 09:10 就别在 09:10 之前动这个账号。
+	不跨天回滚 —— 上游的 `window_start` 在 0 点日界的站点上会把 09:10 之前的时段算成
+	「昨天的窗口」，于是面板每天凌晨去签一次，设置形同废纸（实测：relay18 00:42 签、
+	09:12 再签被判「今天没记录」，整天报失败）。
+	"""
+	now = now or datetime.now().astimezone()
+	hour, minute = _clock(account.checkin_after)
+	return now.replace(hour=hour, minute=minute, second=0, microsecond=0).timestamp()
 
 
 class CheckInService:
@@ -142,6 +187,7 @@ class CheckInService:
 		self.store = store
 		self._gate = asyncio.Semaphore(concurrency)
 		self._running: set[int] = set()
+		self._importing: set[int] = set()
 
 	@staticmethod
 	def _login(account: Account) -> newapi.Login:
@@ -164,6 +210,8 @@ class CheckInService:
 		# One run at a time per account: two browser logins on one profile directory
 		# fight over Chrome's profile lock, and pressing 签到 while the scheduler is
 		# already on that account would just wait for it in silence.
+		if account_id in self._importing:
+			return newapi.Outcome(False, error='该账号正在导入 GitHub 会话，已跳过本次签到，请等待导入结果')
 		if account_id in self._running:
 			# Almost always the scheduler: it ticks on startup and takes every overdue
 			# account, so opening the panel and pressing 签到 collides by design. Saying
@@ -182,30 +230,31 @@ class CheckInService:
 					outcome, site = await self._attempt(account)
 				except Exception as e:  # network/browser/anything — one account must not kill a batch
 					outcome = newapi.Outcome(False, error=newapi.why(e))
+
+			await self._reconcile(account, outcome, started, site)
+
+			updates = {}
+			if outcome.session and outcome.session != account.session:
+				updates['session'] = outcome.session
+			if outcome.api_user and str(outcome.api_user) != (account.api_user or ''):
+				updates['api_user'] = str(outcome.api_user)
+			if outcome.username and not account.username:
+				updates['username'] = outcome.username
+			if updates:
+				self.store.update(account_id, **updates)
+
+			quota = outcome.after_quota if outcome.after_quota is not None else outcome.before_quota
+			self.store.record_result(
+				account_id,
+				success=outcome.success,
+				checked_in=outcome.checked_in,
+				quota=quota,
+				error=outcome.error,
+			)
+			return outcome
 		finally:
+			# Keep account occupancy until reconciliation and credential/result writes finish.
 			self._running.discard(account_id)
-
-		await self._reconcile(account, outcome, started, site)
-
-		updates = {}
-		if outcome.session and outcome.session != account.session:
-			updates['session'] = outcome.session
-		if outcome.api_user and str(outcome.api_user) != (account.api_user or ''):
-			updates['api_user'] = str(outcome.api_user)
-		if outcome.username and not account.username:
-			updates['username'] = outcome.username
-		if updates:
-			self.store.update(account_id, **updates)
-
-		quota = outcome.after_quota if outcome.after_quota is not None else outcome.before_quota
-		self.store.record_result(
-			account_id,
-			success=outcome.success,
-			checked_in=outcome.checked_in,
-			quota=quota,
-			error=outcome.error,
-		)
-		return outcome
 
 	async def _reconcile(
 		self,
@@ -223,6 +272,10 @@ class CheckInService:
 		stays true all day. An entry from this run is 签到成功, an older one from today is
 		今日已签到, and no entry today means the login worked but the bonus did not land.
 		"""
+		if account.mechanism == 'visit' and _open_only_visit(account):
+			# The open-only browser already checked its type-1 Daily allowance with the SPA Bearer.
+			# Generic check-in status/type-4 logs cannot confirm or overrule that receipt.
+			return
 		credentials = dict(
 			session=newapi.parse_session(outcome.session or account.session),
 			access_token=outcome.access_token or account.access_token,
@@ -249,7 +302,13 @@ class CheckInService:
 		stamp = await newapi.last_checkin_at(account.base_url, **credentials)
 		if stamp is None:  # the site does not say; keep whatever the attempt concluded
 			return
-		if stamp >= window_start(account):
+		# 本机 修正：判定「今天有没有签到」用**本地自然日 0 点**，不是 `window_start`。
+		# `window_start` 是「从 checkin_after 起算的窗口」，对 anyrouter 这类 08:30 开窗的
+		# 站点是对的；但对日界在 0 点、凌晨就把奖励发掉的站点（实测 relay18 每天
+		# 00:42~03:37 就落记录），拿 09:10/10:10 当今天起点就会把凌晨那条判成「昨天的」，
+		# 于是一整天都在报「今天没有签到记录」——奖励明明在账上。`checkin_after` 只该
+		# 决定「最早什么时候去尝试」（由 `due()` 负责），不该决定「哪一天」。
+		if stamp >= _today_start():
 			outcome.checked_in = stamp >= started
 			if not outcome.success:  # credited anyway — do not retry it every 30 minutes
 				outcome.success, outcome.error = True, None
@@ -279,7 +338,7 @@ class CheckInService:
 		if await sub2api.looks_like_sub2api(account.base_url):
 			outcome = await sub2api.check_in(login)
 			return outcome, site
-		if account.mechanism == 'visit' and not site.checkin_path:
+		if account.mechanism == 'visit' and (not site.checkin_path or _open_only_visit(account)):
 			# The owner told us this site grants the bonus when an authenticated page
 			# loads. There is nothing to POST and nothing to re-login for, and on a
 			# WAF'd site the protocol attempt cannot even reach the login route.
@@ -290,7 +349,7 @@ class CheckInService:
 			# `/api/user/checkin`. Taking the browser there is a dead end: on a JWT fork the
 			# in-page reads need a Bearer token the page alone will not hand over, so an
 			# OAuth account with no password could never reach a logged-in state.
-			return await self._browser_visit(account, site), site
+			return await self._browser_visit(account, site, open_only=_open_only_visit(account)), site
 		outcome = await newapi.check_in(login, site)
 		# A JWT fork rotates its refresh token on every exchange, so the value we just
 		# used is already dead. Store the new one *now*: if a later step fails, the run
@@ -316,7 +375,7 @@ class CheckInService:
 			return await self._browser_visit(account, site), site
 		return outcome, site
 
-	async def _browser_visit(self, account: Account, site: newapi.SiteInfo) -> newapi.Outcome:
+	async def _browser_visit(self, account: Account, site: newapi.SiteInfo, *, open_only: bool = False) -> newapi.Outcome:
 		"""Load the site in a browser, hold its automatic check-in, then collect it on purpose.
 
 		Logging in is not the same as collecting: the site's own ledger decides where there
@@ -334,6 +393,8 @@ class CheckInService:
 			return await browser_visit(
 				base_url=account.base_url,
 				account_name=account.name,
+				open_only=open_only,
+				stored_session=newapi.parse_session(account.session) if open_only else None,
 				provider=account.login_method,
 				username=account.username,
 				password=account.password,
@@ -341,7 +402,7 @@ class CheckInService:
 			)
 
 		visit = await visit_once()
-		if not visit.after and account.login_method in BROWSER_METHODS:
+		if not visit.after and account.login_method in BROWSER_METHODS and not open_only:
 			# The site session has lapsed and this account has no password to renew it with —
 			# but the *IdP* session in the same profile normally outlives it by weeks, so the
 			# renewal needs no human at all: run the OAuth hop, then visit again.
@@ -375,6 +436,15 @@ class CheckInService:
 			api_user=after.get('id'),
 			username=after.get('username'),
 		)
+		if open_only:
+			stamp = visit.checkin_at
+			landed = stamp is not None and stamp >= _today_start()
+			return newapi.Outcome(
+				success=landed,
+				checked_in=(stamp >= started if landed else False) if stamp is not None else None,
+				error=None if landed else '已登录站点，但尚未确认今天的 Daily allowance 到账记录；稍后重试',
+				**common,
+			)
 		# A grant is visible in quota+used_quota even when the account spent money mid-run:
 		# spending moves quota into used_quota and leaves the total alone, so only a grant
 		# can raise it. Comparing bare quota called a $25 bonus 'no change' on an account
@@ -686,9 +756,16 @@ class CheckInService:
 				f'只有授权登录的账号需要注入 IdP 会话（当前是 {account.login_method}）：'
 				'密码 / 会话 Cookie 账号直接粘站点自己的 cookie 就够了'
 			)
-		result = await inject(
-			raw, provider=account.login_method, account_name=account.name, base_url=account.base_url, verify=verify
-		)
+		from panel.vendor.utils.browser import ProfileBusyError
+		if account_id in self._running or account_id in self._importing:
+			raise ProfileBusyError('该账号正在签到或导入会话，请等待当前操作结束')
+		self._importing.add(account_id)
+		try:
+			result = await inject(
+				raw, provider=account.login_method, account_name=account.name, base_url=account.base_url, verify=verify
+			)
+		finally:
+			self._importing.discard(account_id)
 		if result.credential:
 			# The verification logged in for real, so it came back with a live site session
 			# and the account's id. Storing them makes the account usable now rather than

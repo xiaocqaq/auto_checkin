@@ -4,7 +4,9 @@ The one piece that cannot be validated live without a human at the IdP, so the
 loop's decisions are pinned here instead.
 """
 import json
+from asyncio import sleep as real_sleep
 from dataclasses import dataclass, field
+from time import monotonic as real_monotonic
 
 import pytest
 
@@ -147,6 +149,25 @@ async def test_returns_the_session_that_authenticates_not_the_first_one(browser)
 	assert context.closed
 
 
+async def test_cancelled_rollback_still_closes_owned_context(browser, monkeypatch):
+	context, _, _ = browser
+
+	async def fail_navigation(*_, **__):
+		raise RuntimeError('navigation failed')
+
+	original_add = context.add_cookies
+	async def cancel_restore(cookies):
+		if any(c['domain'] == 'site.test' for c in cookies):
+			raise bl.asyncio.CancelledError()
+		await original_add(cookies)
+
+	monkeypatch.setattr(bl, '_goto_login', fail_navigation)
+	monkeypatch.setattr(context, 'add_cookies', cancel_restore)
+	with pytest.raises(bl.asyncio.CancelledError):
+		await _login()
+	assert context.closed, 'rollback cancellation must not bypass browser cleanup'
+
+
 async def test_a_waf_in_front_of_the_api_does_not_block_the_login(browser, monkeypatch):
 	"""relay9 now answers /api/user/self with an Aliyun CAPTCHA page, which no
 	cookie gets past — but the SPA next door is logged in and says so (ADR-0010)."""
@@ -215,6 +236,72 @@ async def test_the_wait_is_bounded_by_the_clock_not_the_tick_count(browser, monk
 		await _login(headless=False)
 
 	assert polls['n'] <= 13, f'{polls["n"]} polls in a 300s window means the clock was ignored'
+
+
+@pytest.mark.parametrize('phase', ['navigation', 'site_api'])
+@pytest.mark.parametrize('headless', [False, True])
+async def test_whole_login_timeout_cancels_hung_io_and_releases_profile(browser, monkeypatch, tmp_path, phase, headless):
+	"""Real timer, real profile lease, fake browser: neither goto nor JS fetch may outlive the budget."""
+	from panel.vendor.utils.browser import _acquire_profile_lease, _PersistentBrowserContext
+
+	context, _, _ = browser
+	before = await context.cookies()
+	profile = tmp_path / 'github' / 'A'
+	leased = _PersistentBrowserContext(context, _acquire_profile_lease(profile))
+	cancelled = bl.asyncio.Event()
+	monkeypatch.setattr(bl.time, 'monotonic', real_monotonic)
+	monkeypatch.setattr(bl.asyncio, 'sleep', real_sleep)
+	monkeypatch.setattr(bl, 'SESSION_TIMEOUT_S' if headless else 'HUMAN_TIMEOUT_S', 0.03)
+	monkeypatch.setattr(bl, 'launch_login_context', lambda *a, **k: _async(leased))
+
+	async def hang():
+		try:
+			await bl.asyncio.Event().wait()
+		finally:
+			cancelled.set()
+
+	if phase == 'navigation':
+		async def hung_navigation(*_, **__):
+			await hang()
+		monkeypatch.setattr(bl, '_goto_login', hung_navigation)
+	else:
+		original_evaluate = FakePage.evaluate
+		async def hung_site_api(self, expression, *args):
+			if expression == bl.SITE_JSON_JS:
+				await hang()
+			return await original_evaluate(self, expression, *args)
+		monkeypatch.setattr(FakePage, 'evaluate', hung_site_api)
+
+	task = bl.asyncio.create_task(_login(headless=headless))
+	try:
+		done, _ = await bl.asyncio.wait({task}, timeout=0.3)
+		assert task in done, 'the whole budget must cancel an in-flight await, not only check the next tick'
+		with pytest.raises(TimeoutError, match='内没拿到会话'):
+			await task
+		assert cancelled.is_set(), 'the hung goto/evaluate coroutine must actually be cancelled'
+		assert sorted(await context.cookies(), key=lambda c: c['domain']) == sorted(before, key=lambda c: c['domain']), 'restore site cookies and preserve the IdP before closing'
+		assert context.closed
+		lease = _acquire_profile_lease(profile)
+		lease.close()
+	finally:
+		task.cancel()
+		await bl.asyncio.gather(task, return_exceptions=True)
+
+
+async def test_whole_login_timeout_reports_phase_without_oauth_secrets(browser, monkeypatch):
+	context, _, _ = browser
+	monkeypatch.setattr(bl.asyncio, 'sleep', real_sleep)
+	monkeypatch.setattr(bl.time, 'monotonic', real_monotonic)
+	async def hung_navigation(page, *args):
+		page.url = 'https://private-user:private-password@site.test/callback/private-path?code=private-code#private-fragment'
+		await bl.asyncio.Event().wait()
+	monkeypatch.setattr(bl, '_goto_login', hung_navigation)
+	with pytest.raises(TimeoutError) as error:
+		await bl.browser_login(base_url=SITE, provider='github', account_name='A', headless=True, _timeout_s=0.03)
+	text = str(error.value)
+	assert '阶段：打开站点登录页' in text and 'site.test' in text
+	assert 'private-' not in text, 'timeout evidence must never include OAuth code, path, userinfo or fragment'
+	assert context.closed
 
 
 async def test_a_path_unsafe_name_cannot_reach_outside_its_profile_folder(browser):
@@ -451,6 +538,187 @@ async def test_injection_writes_into_the_profile_the_daily_hop_reads(browser):
 	assert (result.injected, result.hosts) == (2, ('linux.do',))
 	assert (result.verified, result.credential) == (True, LIVE)
 	assert result.api_user == str(USER_ID)
+
+
+async def test_injection_verifies_before_releasing_the_profile(browser, monkeypatch):
+	context, grants, _ = browser
+	grants.append({'name': 'session', 'value': LIVE, 'domain': 'site.test'})
+	launches = []
+
+	async def launch(settings, **kw):
+		launches.append(settings)
+		assert len(launches) == 1, 'verification must not reopen a profile another import can overwrite'
+		context.settings = settings
+		return context
+
+	monkeypatch.setattr(bl, 'launch_login_context', launch)
+	result = await bl.inject_idp_cookies(EXPORTED, provider='github', account_name='A', base_url=SITE)
+	assert result.verified is True
+	assert context.closed
+	assert len(launches) == 1
+
+
+@pytest.mark.parametrize('phase', ['launch', 'add_cookies'])
+async def test_whole_injection_timeout_cancels_preverification_io(browser, monkeypatch, tmp_path, phase):
+	"""The import budget starts before launch/write, with cleanup owned by the launcher or caller."""
+	import sys
+	from types import SimpleNamespace
+	from panel.vendor.utils import browser as br
+
+	context, _, _ = browser
+	before = await context.cookies()
+	profile = tmp_path / 'github' / 'A'
+	entered = bl.asyncio.Event()
+	allow_launch = bl.asyncio.Event()
+	cancelled = bl.asyncio.Event()
+	jar = json.dumps([{'name': 'user_session', 'value': 'imported', 'domain': '.github.com', 'path': '/'}])
+	monkeypatch.setattr(bl.time, 'monotonic', real_monotonic)
+	monkeypatch.setattr(bl.asyncio, 'sleep', real_sleep)
+	monkeypatch.setattr(bl, 'INJECTION_TIMEOUT_S', 0.03, raising=False)
+
+	if phase == 'launch':
+		settings = br.BrowserLoginSettings(
+			headless=True, humanize=False, wait_timeout_ms=1000, profile_dir=profile,
+			cloakbrowser_binary_path=None, persist_profile=True,
+		)
+		async def delayed_launch(*_, **__):
+			entered.set()
+			await allow_launch.wait()
+			return context
+		monkeypatch.setitem(sys.modules, 'cloakbrowser', SimpleNamespace(launch_persistent_context_async=delayed_launch))
+		monkeypatch.setattr(br, 'get_playwright_proxy', lambda **_: None)
+		monkeypatch.delenv('CHECKIN_BROWSER_PROXY', raising=False)
+		monkeypatch.setattr(bl, 'load_browser_login_settings', lambda *a, **k: settings)
+		monkeypatch.setattr(bl, 'launch_login_context', br.launch_login_context)
+	else:
+		leased = br._PersistentBrowserContext(context, br._acquire_profile_lease(profile))
+		monkeypatch.setattr(bl, 'launch_login_context', lambda *a, **k: _async(leased))
+		async def hung_add(cookies):
+			entered.set()
+			try:
+				await bl.asyncio.Event().wait()
+			finally:
+				cancelled.set()
+		monkeypatch.setattr(context, 'add_cookies', hung_add)
+
+	task = bl.asyncio.create_task(bl.inject_idp_cookies(jar, provider='github', account_name='A', base_url=SITE))
+	try:
+		await bl.asyncio.wait_for(entered.wait(), timeout=0.3)
+		if phase == 'launch':
+			await real_sleep(0.06)
+			assert task.cancelling(), 'the import deadline must cancel launch, not start after it returns'
+			assert not context.closed and not task.done(), 'launch cleanup safely waits for its late context'
+			with pytest.raises(br.ProfileBusyError):
+				br._acquire_profile_lease(profile)
+			allow_launch.set()
+		done, _ = await bl.asyncio.wait({task}, timeout=0.3)
+		assert task in done, 'the import deadline must cancel add_cookies before verification starts'
+		with pytest.raises(TimeoutError, match='启动' if phase == 'launch' else '写入'):
+			await task
+		assert phase == 'launch' or cancelled.is_set()
+		assert await context.cookies() == before, 'a pre-verification failure is not a successful injection'
+		assert context.closed
+		lease = br._acquire_profile_lease(profile)
+		lease.close()
+	finally:
+		allow_launch.set()
+		task.cancel()
+		await bl.asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.parametrize('hang_during_write', [False, True])
+async def test_injection_close_outlives_work_budget_without_releasing_lease(browser, monkeypatch, tmp_path, hang_during_write):
+	"""240s is a work deadline, not permission to unlock a browser whose safe close is still running."""
+	from panel.vendor.utils import browser as br
+
+	context, _, _ = browser
+	profile = tmp_path / 'github' / 'A'
+	leased = br._PersistentBrowserContext(context, br._acquire_profile_lease(profile))
+	closing = bl.asyncio.Event()
+	allow_close = bl.asyncio.Event()
+	monkeypatch.setattr(bl.time, 'monotonic', real_monotonic)
+	monkeypatch.setattr(bl.asyncio, 'sleep', real_sleep)
+	monkeypatch.setattr(bl, 'INJECTION_TIMEOUT_S', 0.03)
+	monkeypatch.setattr(bl, 'launch_login_context', lambda *a, **k: _async(leased))
+
+	async def slow_close():
+		closing.set()
+		await allow_close.wait()
+		context.closed = True
+	monkeypatch.setattr(context, 'close', slow_close)
+	if hang_during_write:
+		async def hung_add(cookies):
+			await bl.asyncio.Event().wait()
+		monkeypatch.setattr(context, 'add_cookies', hung_add)
+
+	task = bl.asyncio.create_task(bl.inject_idp_cookies(EXPORTED, provider='github', account_name='A', base_url=SITE, verify=False))
+	try:
+		await bl.asyncio.wait_for(closing.wait(), timeout=0.3)
+		await real_sleep(0.06)
+		assert not task.done() and not context.closed, 'safe close must remain awaited past the work deadline'
+		with pytest.raises(br.ProfileBusyError):
+			br._acquire_profile_lease(profile)
+		allow_close.set()
+		if hang_during_write:
+			with pytest.raises(TimeoutError, match='写入'):
+				await task
+		else:
+			assert (await task).injected == 2
+		assert context.closed
+		lease = br._acquire_profile_lease(profile)
+		lease.close()
+	finally:
+		allow_close.set()
+		task.cancel()
+		await bl.asyncio.gather(task, return_exceptions=True)
+		await leased.close()
+
+
+@pytest.mark.parametrize('budget_kind', ['verification', 'whole_import'])
+async def test_injection_verification_timeout_preserves_cookies_and_releases_profile(browser, monkeypatch, tmp_path, budget_kind):
+	"""Both the proof budget and the enclosing import budget preserve already-written IdP cookies."""
+	from panel.vendor.utils.browser import _acquire_profile_lease, _PersistentBrowserContext
+
+	context, _, _ = browser
+	site_before = _site_cookies(context)
+	profile = tmp_path / 'github' / 'A'
+	leased = _PersistentBrowserContext(context, _acquire_profile_lease(profile))
+	jar = json.dumps([{'name': 'user_session', 'value': 'imported', 'domain': '.github.com', 'path': '/'}])
+	cancelled = bl.asyncio.Event()
+	monkeypatch.setattr(bl, 'INJECTION_VERIFY_TIMEOUT_S' if budget_kind == 'verification' else 'INJECTION_TIMEOUT_S', 0.03)
+	monkeypatch.setattr(bl.time, 'monotonic', real_monotonic)
+	monkeypatch.setattr(bl.asyncio, 'sleep', real_sleep)
+	monkeypatch.setattr(bl, 'launch_login_context', lambda *a, **k: _async(leased))
+	original_evaluate = FakePage.evaluate
+
+	async def hung_site_api(self, expression, *args):
+		if expression == bl.SITE_JSON_JS:
+			try:
+				await bl.asyncio.Event().wait()
+			finally:
+				cancelled.set()
+		return await original_evaluate(self, expression, *args)
+
+	monkeypatch.setattr(FakePage, 'evaluate', hung_site_api)
+	task = bl.asyncio.create_task(bl.inject_idp_cookies(jar, provider='github', account_name='A', base_url=SITE))
+	try:
+		done, _ = await bl.asyncio.wait({task}, timeout=0.3)
+		assert task in done, 'import verification must use its shorter whole-hop deadline'
+		result = await task
+		assert result.verified is False and result.injected == 1
+		assert '0.03s' in (result.reason or '') and '超时' in result.reason
+		if budget_kind == 'whole_import':
+			assert '整体导入' in result.reason and 'IdP cookie 保留' in result.reason
+		assert result.credential is None
+		assert cancelled.is_set()
+		assert _site_cookies(context) == site_before, 'failed verification restores the existing site session'
+		assert bl.playwright_cookies(jar)[0] in await context.cookies(), 'the imported GitHub login remains'
+		assert context.closed
+		lease = _acquire_profile_lease(profile)
+		lease.close()
+	finally:
+		task.cancel()
+		await bl.asyncio.gather(task, return_exceptions=True)
 
 
 async def test_injection_can_skip_the_proof_but_then_claims_none(browser):
@@ -852,3 +1120,179 @@ async def test_a_login_that_lands_does_not_put_the_old_session_back(browser):
 	values = [c['value'] for c in _site_cookies(context)]
 	assert 'state-only' not in values, 'the pre-login state cookie must not come back'
 	assert values == [LIVE], 'exactly the card the login won, and nothing beside it'
+
+@pytest.fixture
+def refresh_visit_browser(monkeypatch):
+	"""The open-only SPA keeps the Bearer in memory, not localStorage.user."""
+	base = 'https://relay16.example'
+	box = {'body': {'success': True, 'data': {'user': USER, 'access_token': 'spa-bearer'}},
+		'ok': True, 'respond': True, 'ledger': None, 'current_user': USER, 'reads': [], 'now': 0.0}
+	async def advance(seconds):
+		box['now'] += seconds
+	monkeypatch.setattr(bl.time, 'monotonic', lambda: box['now'])
+	monkeypatch.setattr(bl.asyncio, 'sleep', advance)
+	context = FakeContext([
+		{'name': bl.newapi.REFRESH_COOKIE, 'value': 'profile-refresh', 'domain': 'relay16.example'},
+		{'name': 'user_session', 'value': 'github-idp', 'domain': 'github.com'},
+	], [])
+
+	class Response:
+		url = base + bl.newapi.REFRESH_PATH
+		@property
+		def ok(self):
+			return box['ok']
+		async def json(self):
+			await real_sleep(0)  # the SPA finishes refreshing asynchronously
+			return box['body']
+
+	class RefreshWaiter:
+		def __init__(self, predicate):
+			self.predicate = predicate
+		async def __aenter__(self):
+			return self
+		async def __aexit__(self, *exc):
+			if not box['respond']:
+				raise TimeoutError('refresh response timed out')
+		@property
+		def value(self):
+			async def response():
+				assert self.predicate(Response())
+				return Response()
+			return response()
+
+	class Page(FakePage):
+		async def evaluate(self, expression, args=None):
+			if args and isinstance(args, list) and args[0].startswith('/api/'):
+				path, token = args
+				assert token == 'spa-bearer', 'use the SPA Bearer without a second refresh'
+				assert not context.closed, 'keep the authenticated page alive until confirmation'
+				box['reads'].append(path)
+				if path.startswith('/api/log/self'):
+					if 'ledgers' in box:
+						return box['ledgers'].pop(0) if len(box['ledgers']) > 1 else box['ledgers'][0]
+					return box['ledger']
+				assert path == '/api/user/self', 'only read user and allowance ledger, never POST'
+				return {'success': True, 'data': box['current_user']}
+			return await super().evaluate(expression, args)
+		def expect_response(self, predicate, **_):
+			return RefreshWaiter(predicate)
+		async def goto(self, url, **kwargs):
+			await super().goto(url, **kwargs)
+			for cookie in context._cookies:
+				if cookie['name'] == bl.newapi.REFRESH_COOKIE:
+					cookie['value'] = 'rotated-refresh'
+
+	page = Page()
+	async def new_page():
+		context.pages.append(page)
+		return page
+	async def launch(*_, **__):
+		return context
+	async def noop(*_, **__):
+		pass
+	async def forbidden(*_, **__):
+		raise AssertionError('open-only must not log out, log in, or post check-in')
+	monkeypatch.setattr(context, 'new_page', new_page)
+	monkeypatch.setattr(bl, 'load_browser_login_settings', lambda *_: FakeSettings())
+	monkeypatch.setattr(bl, 'launch_login_context', launch)
+	monkeypatch.setattr(bl, 'prepare_browser_page', noop)
+	monkeypatch.setattr(bl, 'wait_for_waf_ready', noop)
+	for name in ('_hold_check_in', '_release_check_in', '_site_check_in', '_forget_site', 'login_with_email_form'):
+		monkeypatch.setattr(bl, name, forbidden)
+	return context, page, box
+
+
+async def test_open_only_recognizes_spa_refresh_without_legacy_user_storage(refresh_visit_browser):
+	context, page, _ = refresh_visit_browser
+	visit = await bl.browser_visit(base_url='https://relay16.example', account_name='open_only', provider='github',
+		open_only=True, stored_session='stale-db-refresh')
+	assert visit.after == USER, 'a successful SPA refresh is an authenticated visit'
+	assert visit.session == 'rotated-refresh', 'keep the newest refresh cookie for the next daily visit'
+	assert page.gotos == ['https://relay16.example/console']
+	assert not any(c['name'] == 'session' for c in context._cookies), 'a refresh token is not a legacy session cookie'
+	assert any(c['value'] == 'github-idp' for c in context._cookies)
+	assert visit.checkin_path is None and visit.held is False
+	assert context.closed
+
+@pytest.mark.parametrize('body,ok', [
+	({'success': False, 'data': {'user': USER}}, True),
+	({'success': True, 'data': {'user': USER}}, False),
+	({'success': True, 'data': {'user': {}}}, True),
+	({'success': True, 'data': None}, True),
+	(None, True),
+])
+async def test_open_only_rejects_unconfirmed_refresh_even_with_cookie_and_stale_storage(refresh_visit_browser, body, ok):
+	context, page, box = refresh_visit_browser
+	box.update(body=body, ok=ok)
+	page.storage.update(STALE)
+	visit = await bl.browser_visit(base_url='https://relay16.example', account_name='open_only', open_only=True)
+	assert visit.after is None, 'cookie presence or stale localStorage must not manufacture a successful visit'
+	assert context.closed
+
+
+async def test_open_only_seeds_refresh_cookie_when_profile_has_none(refresh_visit_browser):
+	context, _, _ = refresh_visit_browser
+	context._cookies = [c for c in context._cookies if c['name'] != bl.newapi.REFRESH_COOKIE]
+	visit = await bl.browser_visit(base_url='https://relay16.example', account_name='open_only',
+		open_only=True, stored_session='saved-refresh')
+	assert visit.after == USER and visit.session == 'rotated-refresh'
+	assert not any(c['name'] == 'session' for c in context._cookies)
+	assert context.closed
+
+
+async def test_open_only_refresh_timeout_releases_profile(refresh_visit_browser):
+	context, _, box = refresh_visit_browser
+	box['respond'] = False
+	with pytest.raises(TimeoutError):
+		await bl.browser_visit(base_url='https://relay16.example', account_name='open_only', open_only=True)
+	assert context.closed
+
+
+async def test_open_only_waits_for_daily_allowance_then_reads_current_balance(refresh_visit_browser):
+	context, page, box = refresh_visit_browser
+	stamp = int(bl.time.time())
+	box['ledgers'] = [
+		{'success': True, 'data': {'items': []}},
+		{'success': True, 'data': {'items': [
+			{'type': 1, 'content': 'Daily allowance ＄20.000000', 'created_at': stamp},
+		]}},
+	]
+	box['current_user'] = dict(USER, quota=10_500_000)
+	visit = await bl.browser_visit(base_url='https://relay16.example', account_name='open_only', provider='github', open_only=True)
+	assert visit.checkin_at == stamp, 'refresh authentication alone is not an allowance receipt'
+	assert visit.before == USER and visit.after['quota'] == 10_500_000
+	assert len([p for p in box['reads'] if p.startswith('/api/log/self')]) == 2
+	assert box['reads'][-1] == '/api/user/self', 'balance must be read after the receipt'
+	assert all('type=1' in p for p in box['reads'] if p.startswith('/api/log/self'))
+	assert box['now'] > 0 and context.closed
+	assert visit.session == 'rotated-refresh' and not visit.held and visit.checkin_path is None
+	assert page.gotos == ['https://relay16.example/console']
+
+
+@pytest.mark.parametrize('items,expected', [
+	([{'type': 1, 'content': 'Daily allowance ＄20.000000', 'created_at': 1794591900}], 1794591900),
+	([{'type': 1, 'content': '充值成功', 'created_at': 1794712680}], None),
+	([{'type': 4, 'content': 'Daily allowance ＄20.000000', 'created_at': 1794712680}], None),
+	([{'type': 1, 'content': 'Daily allowance ＄20.000000', 'created_at': '1794712680'}], None),
+	([{'type': 1, 'content': 'Daily allowance ＄20.000000', 'created_at': True}], None),
+	([{'type': 1, 'content': 'Daily allowance ＄20.000000', 'created_at': float('inf')}], None),
+	([None, {}], None),
+])
+async def test_open_only_requires_a_valid_daily_allowance_receipt(refresh_visit_browser, items, expected):
+	context, _, box = refresh_visit_browser
+	box['ledger'] = {'success': True, 'data': {'items': items}}
+	visit = await bl.browser_visit(base_url='https://relay16.example', account_name='open_only', open_only=True)
+	assert box['reads'], 'actually read the site ledger with the SPA Bearer'
+	assert visit.checkin_at == expected
+	assert visit.after == USER and visit.session == 'rotated-refresh' and context.closed
+	assert box['now'] <= 30, 'no receipt must stop at a bounded deadline'
+
+
+@pytest.mark.parametrize('ledger', [None, {'success': False, 'data': {'items': []}}, {'success': True, 'data': None}])
+async def test_open_only_ledger_failure_preserves_rotated_session(refresh_visit_browser, ledger):
+	context, _, box = refresh_visit_browser
+	box['ledger'] = ledger
+	visit = await bl.browser_visit(base_url='https://relay16.example', account_name='open_only', open_only=True)
+	assert box['reads'], 'authentication must be followed by allowance verification'
+	assert visit.checkin_at is None and visit.after == USER
+	assert visit.session == 'rotated-refresh' and context.closed

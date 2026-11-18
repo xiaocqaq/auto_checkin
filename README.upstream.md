@@ -181,14 +181,14 @@ LinuxDO / 谷歌）一点都不用碰 —— 站点当初用什么方式登的�
 站点给的凭据有两种，能用第一种就别用第二种。
 
 **首选：访问令牌。** 多数 New API 站点的用户页里有「访问令牌 / Access Token」（本仓库实测
-`api.hcnsec.cn`：`/profile` → 访问令牌 → 生成）。它是明文一串，站点界面上直接复制，**不需要任何
+`relay1.example`：`/profile` → 访问令牌 → 生成）。它是明文一串，站点界面上直接复制，**不需要任何
 浏览器扩展**，也不像 cookie 那样一个月就过期。面板里**登录方式**选「Access Token」粘进去即可 ——
 面板把它作为 `Authorization` 头发出去，站点的 `/api/user/self` 和签到路由都认。
 
 **退路：会话 Cookie。** 站点不提供访问令牌时才用这条。
 
 1. 在自己电脑的浏览器里打开**这个签到站点**并登录。
-2. 取出 `session` 这条 cookie 的**值**。它通常是 **HttpOnly** 的（实测 `api.hcnsec.cn`：
+2. 取出 `session` 这条 cookie 的**值**。它通常是 **HttpOnly** 的（实测 `relay1.example`：
    `HttpOnly; SameSite=Strict; Max-Age=2592000`），所以页面 JS 读不到；用浏览器自带的
    **DevTools → Application → Cookies → 该站点 → `session` → 复制 Value** 最稳。
    cookie 扩展也能读 HttpOnly，但得先确认它在这个站点上有权限、且停在**站点自己的页面**上 ——
@@ -210,12 +210,12 @@ id」，而不是笼统地报凭据无效。把这个值填进弹窗里的 **API
 
 两个限制，界面上也会直接提示：
 
-- **面板续不了会话 cookie。** 过期就得再粘一次（`api.hcnsec.cn` 实测 30 天）。访问令牌没这个问题，
+- **面板续不了会话 cookie。** 过期就得再粘一次（`relay1.example` 实测 30 天）。访问令牌没这个问题，
   有密码的账号面板能自己重新登录，OAuth-only 的走方案 B 一次管数周到数月。
 - **只够 `endpoint` 站点用。** `login_bonus` 靠重新登录发额度（协议层面就要密码），`visit` 要
   真的在登录状态下加载页面（relay8），这两种都不是一个 cookie 或令牌能替代的。
 
-顺一句：这个站点如果还开着密码登录、又不要 Turnstile（`api.hcnsec.cn` 就是这样），那连粘都不用粘 ——
+顺一句：这个站点如果还开着密码登录、又不要 Turnstile（`relay1.example` 就是这样），那连粘都不用粘 ——
 直接填账号密码，面板每天纯 HTTP 跑完，凭据永不过期。先试这个。
 
 ### 方案 B：OAuth-only 身份，把 IdP 会话注入进去

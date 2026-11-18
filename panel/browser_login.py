@@ -10,6 +10,7 @@ README there for what they are and what was changed.
 """
 import asyncio
 import json
+import math
 import os
 import re
 import shutil
@@ -101,6 +102,8 @@ IDP_CHALLENGE_MAX_ATTEMPTS = 3  # per challenged page, not per run — the hop i
 # Still a hard deadline: a chain that survives it fails honestly rather than hanging.
 SESSION_TIMEOUT_S = 600
 HUMAN_TIMEOUT_S = 300  # visible window: someone is typing a password and a 2FA code
+INJECTION_VERIFY_TIMEOUT_S = 180  # imported cookies are retained even if this shorter proof times out
+INJECTION_TIMEOUT_S = 240  # launch + cookie write + verification; safe close may take longer
 POLL_S = 2
 HUMAN_AFTER_TICKS = 5  # ~10s of redirects is plenty; after that a login page means a human is needed
 # ~30s with no page moving at all. An OAuth hop is a chain of navigations, and consent
@@ -927,6 +930,62 @@ async def _site_user(page, api_user=None) -> Optional[dict]:
 	return data if isinstance(data, dict) and data.get('id') else None
 
 
+OPEN_ONLY_JSON_JS = """async ([path, token]) => {
+	try {
+		const r = await fetch(path, {
+			headers: {Accept: 'application/json', Authorization: 'Bearer ' + token},
+			credentials: 'include', cache: 'no-store', signal: AbortSignal.timeout(8000)
+		});
+		return r.ok ? await r.json() : null;
+	} catch (e) { return null; }
+}"""
+
+
+async def _open_only_allowance(page, token: Optional[str], user: dict) -> tuple[dict, Optional[float]]:
+	"""Keep the SPA alive until its daily allowance is visible; never refresh or claim it ourselves."""
+	if not isinstance(token, str) or not token:
+		return user, None
+	deadline = time.monotonic() + 30
+	today = time.mktime(time.localtime()[:3] + (0, 0, 0, 0, 0, -1))
+	latest = None
+	current = user
+
+	async def get(path):
+		try:
+			return await asyncio.wait_for(
+				page.evaluate(OPEN_ONLY_JSON_JS, [path, token]),
+				timeout=max(0.1, min(8, deadline - time.monotonic())),
+			)
+		except Exception:  # keep the rotating credential even if confirmation is unreadable
+			return None
+
+	while time.monotonic() < deadline:
+		body = await get('/api/log/self?type=1&p=0&page_size=100')
+		data = body.get('data') if isinstance(body, dict) and body.get('success') is True else None
+		items = data.get('items') if isinstance(data, dict) else data
+		if isinstance(items, list):
+			stamps = [
+				item.get('created_at') for item in items
+				if isinstance(item, dict) and item.get('type') == 1
+				and re.match(r'^Daily allowance(?:\s|$)', str(item.get('content') or ''), re.I)
+			]
+			valid = [s for s in stamps if type(s) in (int, float) and math.isfinite(s) and 0 < s <= time.time() + 5]
+			if valid:
+				latest = max(latest or 0, max(valid))
+		# Read after the ledger: the refresh response may predate the grant.
+		body = await get('/api/user/self')
+		data = body.get('data') if isinstance(body, dict) and body.get('success') is True else None
+		if isinstance(data, dict) and data.get('id') == user.get('id'):
+			current = data
+		if latest is not None and latest >= today:
+			break
+		remaining = deadline - time.monotonic()
+		if remaining <= 0:
+			break
+		await asyncio.sleep(min(2, remaining))
+	return current, latest
+
+
 async def browser_visit(
 	*,
 	base_url: str,
@@ -935,6 +994,8 @@ async def browser_visit(
 	username: Optional[str] = None,
 	password: Optional[str] = None,
 	headless: bool = True,
+	open_only: bool = False,
+	stored_session: Optional[str] = None,
 ) -> BrowserVisit:
 	"""Load the site in a browser that is (or gets) logged in, and collect the bonus.
 
@@ -958,8 +1019,34 @@ async def browser_visit(
 	settings = replace(load_browser_login_settings(profile, provider), headless=headless)
 	context = await launch_login_context(settings)
 	try:
+		if open_only and stored_session and not _cookies_named(await context.cookies(), newapi.REFRESH_COOKIE, root):
+			# JWT refresh cookies rotate on page load. The live profile is newer than the
+			# saved credential; only seed an empty profile, using the actual cookie name.
+			await context.add_cookies([{
+				'name': newapi.REFRESH_COOKIE, 'value': stored_session, 'domain': root,
+				'path': '/', 'secure': base_url.startswith('https://'), 'httpOnly': True,
+			}])
 		page = await context.new_page()
 		await prepare_browser_page(page)
+		if open_only:
+			# The open-only SPA keeps its Bearer and user in memory, not localStorage.user. Observe
+			# the SPA's own refresh: issuing another one races its rotating credential.
+			async with page.expect_response(
+				lambda r: r.url.split('?', 1)[0] == f'{base_url}{newapi.REFRESH_PATH}', timeout=30_000
+			) as refreshed:
+				await page.goto(f'{base_url}/console', wait_until='domcontentloaded')
+				await wait_for_waf_ready(page)
+			response = await refreshed.value
+			try:
+				body = await response.json() if response.ok else None
+			except Exception:  # a WAF/HTML response is not proof of a login
+				body = None
+			data = body.get('data') if isinstance(body, dict) and body.get('success') is True else None
+			user = data.get('user') if isinstance(data, dict) else None
+			user = user if isinstance(user, dict) and user.get('id') else None
+			after, stamp = await _open_only_allowance(page, data.get('access_token'), user) if user else (None, None)
+			session = next(iter(_cookies_named(await context.cookies(), newapi.REFRESH_COOKIE, root)), None)
+			return BrowserVisit(before=user, after=after, session=session, checkin_at=stamp, held=False)
 		# Hold the SPA's own check-in until the balance has been read, or the bonus lands
 		# before anything can measure it — which is the whole bug this exists to prevent.
 		held = await _hold_check_in(page)
@@ -967,7 +1054,7 @@ async def browser_visit(
 		await wait_for_waf_ready(page)
 		spa = await _spa_user(context, root)
 		before = await _site_user(page, (spa or {}).get('id')) or spa
-		if not before and username and password:
+		if not before and username and password and not open_only:
 			await page.goto(f'{base_url}/login', wait_until='domcontentloaded')
 			await wait_for_waf_ready(page)
 			# relay8 opens the day with an announcement modal over the form, so the
@@ -1003,13 +1090,38 @@ async def browser_visit(
 
 
 async def browser_login(
-	*, base_url: str, provider: str, account_name: str, headless: bool = False
+	*, base_url: str, provider: str, account_name: str, headless: bool = False, _context=None,
+	_timeout_s: Optional[float] = None,
+) -> BrowserLogin:
+	"""Log in within one budget, including launch, navigation and in-page API waits.
+
+	Cancellation unwinds the hop's existing cookie rollback and owned-context close;
+	an injected context remains the caller's responsibility to close.
+	"""
+	timeout_s = _timeout_s if _timeout_s is not None else (SESSION_TIMEOUT_S if headless else HUMAN_TIMEOUT_S)
+	budget = asyncio.timeout(timeout_s)
+	progress = {'phase': '启动浏览器', 'hosts': ''}
+	try:
+		async with budget:
+			return await _browser_login(
+				base_url=base_url, provider=provider, account_name=account_name,
+				headless=headless, _context=_context, _progress=progress,
+			)
+	except TimeoutError as e:
+		if not budget.expired():
+			raise  # keep the poll loop's observed page/challenge evidence
+		raise TimeoutError(f'{timeout_s}s 内没拿到会话（整体登录超时；阶段：{progress["phase"]}；页面域名：{progress["hosts"] or "尚未打开"}）') from e
+
+
+async def _browser_login(
+	*, base_url: str, provider: str, account_name: str, headless: bool = False, _context=None, _progress=None
 ) -> BrowserLogin:
 	"""Log in through `provider`; return the credential to keep and the user behind it.
 
 	The profile lives at <CHECKIN_BROWSER_PROFILE_DIR>/<provider>/<account_name>, so
 	two accounts never share an identity and the IdP login survives for next time.
 	"""
+	progress = _progress if _progress is not None else {}
 	buttons = PROVIDER_BUTTONS.get(provider)
 	if not buttons:
 		raise ValueError(f'{provider} 不是浏览器登录方式，可选: {tuple(PROVIDER_BUTTONS)}')
@@ -1024,7 +1136,9 @@ async def browser_login(
 	profile = profile_name(account_name)
 	# the caller decides visibility; the env default (CHECKIN_HEADLESS) is for CI
 	settings = replace(load_browser_login_settings(profile, provider), headless=headless)
-	context = await launch_login_context(settings)
+	# Injection supplies its still-open context so cookies cannot be overwritten between
+	# writing and verification; the outer owner alone closes/releases the profile.
+	context = _context if _context is not None else await launch_login_context(settings)
 	# What the logout dropped, and whether anything replaced it. A run that ends without a
 	# credential puts them back (see `_forget_site`): on a `visit` site the cleared session
 	# was the account's whole check-in, and losing it to a click that missed is a regression
@@ -1035,11 +1149,14 @@ async def browser_login(
 		# Before the browser is sent at the IdP: the profile's own Cloudflare state would otherwise
 		# make a managed challenge hang instead of clearing on its own. Scoped to the IdP hosts, so
 		# the site credential below is untouched by it — and it is not a logout of anything.
+		progress['phase'] = '准备站点会话'
 		await _clear_cloudflare_state(context, IDP_HOSTS.get(provider, ()))
 		dropped = await _forget_site(context, root)
 		page = await context.new_page()
 		await prepare_browser_page(page)
+		progress['phase'] = '打开站点登录页'
 		await _goto_login(page, base_url, buttons)
+		progress['phase'] = '等待站点页面就绪'
 		await wait_for_waf_ready(page)
 		await _forget_spa_login(page, base_url, buttons)
 
@@ -1052,6 +1169,7 @@ async def browser_login(
 		# and the card does not repaint — so LinuxDO is nowhere on the page and the run died
 		# reporting the site had no LinuxDO login at all. One reload fixes it, because by then
 		# the status is cached again. Costs nothing when the button was there the first time.
+		progress['phase'] = '点击授权登录'
 		for attempt in range(2):
 			await _unblock_login(page, buttons)  # render, tick the terms box, clear what covers it
 			if await _click_first(page, buttons):
@@ -1076,6 +1194,7 @@ async def browser_login(
 		# `deadline` still bounds the total.
 		challenge_started: dict[int, tuple[str, float, int]] = {}
 		while time.monotonic() < deadline:
+			progress['phase'] = '验证站点登录结果'
 			found = await _logged_in(context, base_url, root)
 			if found:
 				credential, user = found
@@ -1180,6 +1299,7 @@ async def browser_login(
 				seen = []
 				still = 0
 				break
+			progress['phase'] = '等待授权跳转或确认'
 			for open_page in context.pages:  # consent may be a popup or the same tab
 				if 'oauth' in open_page.url or 'authorize' in open_page.url:
 					await dismiss_popups(open_page)
@@ -1217,15 +1337,25 @@ async def browser_login(
 			f'当前页面: {" | ".join(parked)}'
 		)
 	finally:
-		if dropped and not won:
-			# Before the close, so the restore is what gets flushed to disk. Same name,
-			# domain and path as what the failed run may have left, so this overwrites the
-			# useless pre-login state cookie rather than stacking beside it.
+		# Host names alone: paths, query parameters and fragments can carry OAuth secrets.
+		hosts = set()
+		for open_page in context.pages:
 			try:
-				await context.add_cookies(dropped)
-			except Exception:  # a dead context cannot be rolled back; the loss is already taken
+				host = urlsplit(open_page.url).hostname
+				if host:
+					hosts.add(host)
+			except (ValueError, TypeError):
 				pass
-		await context.close()
+		progress['hosts'] = ', '.join(sorted(hosts))
+		try:
+			if dropped and not won:
+				try:
+					await context.add_cookies(dropped)
+				except Exception:
+					pass
+		finally:
+			if _context is None:
+				await context.close()
 
 
 # What an exported cookie's `sameSite` is called on each side. A browser extension exports
@@ -1331,26 +1461,41 @@ async def inject_idp_cookies(
 	# Headless regardless of the env default: this launch only writes cookies to disk, so a
 	# window would flash open for no one to look at.
 	settings = replace(load_browser_login_settings(profile, provider), headless=True)
-	context = await launch_login_context(settings)
+	context = None
+	injected = False
+	phase = '启动浏览器'
+	budget = asyncio.timeout(INJECTION_TIMEOUT_S)
 	try:
-		await context.add_cookies(cookies)
+		async with budget:
+			# Launch owns any late context on cancellation; once returned, this function owns close.
+			context = await launch_login_context(settings)
+			phase = '写入 cookie'
+			await context.add_cookies(cookies)
+			injected = True
+			if not verify:
+				return IdpInjection(len(cookies), hosts, warning=warning)
+			phase = '验证会话'
+			try:
+				result = await browser_login(
+					base_url=base_url, provider=provider, account_name=account_name,
+					headless=True, _context=context, _timeout_s=INJECTION_VERIFY_TIMEOUT_S,
+				)
+			except Exception as e:
+				return IdpInjection(len(cookies), hosts, verified=False, reason=newapi.why(e), warning=warning)
+			return IdpInjection(
+				len(cookies), hosts, verified=True, credential=result.credential,
+				api_user=str(result.user.get('id') or '') or None, warning=warning,
+			)
+	except TimeoutError as e:
+		if not budget.expired():
+			raise
+		if injected:
+			return IdpInjection(
+				len(cookies), hosts, verified=False, warning=warning,
+				reason=f'{INJECTION_TIMEOUT_S}s 整体导入超时（{phase}）；已写入的 IdP cookie 保留，未确认站点会话',
+			)
+		raise TimeoutError(f'{INJECTION_TIMEOUT_S}s 整体导入超时（{phase}），未确认 cookie 注入完成') from e
 	finally:
-		await context.close()
-
-	if not verify:
-		return IdpInjection(len(cookies), hosts, warning=warning)
-	try:
-		result = await browser_login(base_url=base_url, provider=provider, account_name=account_name, headless=True)
-	except Exception as e:
-		# browser_login's headless branch already separates "the IdP wants a human" from
-		# "nothing on this page is moving" (a Cloudflare challenge), and that difference
-		# decides whether re-exporting the cookies would help at all. Pass its words through.
-		return IdpInjection(len(cookies), hosts, verified=False, reason=newapi.why(e), warning=warning)
-	return IdpInjection(
-		len(cookies),
-		hosts,
-		verified=True,
-		credential=result.credential,
-		api_user=str(result.user.get('id') or '') or None,
-		warning=warning,
-	)
+		# Do not deadline or detach close: the shielded context keeps its lease until Chromium exits.
+		if context is not None:
+			await context.close()
